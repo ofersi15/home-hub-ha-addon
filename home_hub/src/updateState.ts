@@ -24,6 +24,8 @@ export const UpdateState = z.object({
   requireStarted: z.boolean().default(false),
   /** Started by the add-on's auto-update (counts toward the 6 h backoff / 2-strike block). */
   auto: z.boolean().default(false),
+  /** OS only: we already asked for the reboot that boots the new version (never ask twice). */
+  rebootRequested: z.boolean().default(false),
 });
 export type UpdateState = z.infer<typeof UpdateState>;
 
@@ -58,7 +60,7 @@ export function fileUpdateStateStore(dir: string): UpdateStateStore {
         if (existsSync(file)) return UpdateState.parse(JSON.parse(readFileSync(file, 'utf8')));
         if (existsSync(legacy)) {
           const l = LegacyInflight.parse(JSON.parse(readFileSync(legacy, 'utf8')));
-          const s: UpdateState = { ...l, toVersion: l.version, phase: 'updating', auto: false };
+          const s: UpdateState = { ...l, toVersion: l.version, phase: 'updating', auto: false, rebootRequested: false };
           write(s);
           rmSync(legacy, { force: true });
           return s;

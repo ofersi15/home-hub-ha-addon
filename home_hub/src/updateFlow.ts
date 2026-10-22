@@ -9,6 +9,8 @@
  *   next start `resumeUpdate` finishes the job from the saved phase.
  * - A failure after the backup always names the backup and says "restore from this backup".
  * - The state is cleared only AFTER the command doc has the outcome (the caller runs `after`).
+ * - OS: a version that is installed but not booted yet ("pending") is finished with one reboot (Supervisor
+ *   `execute_reboot` suggestion), backup first like any update; never a second reboot (DECISIONS D14).
  */
 import { createBackup, type BackupSpec } from './backup.js';
 import { PLATFORM_TARGETS } from './contract.js';
@@ -72,6 +74,8 @@ interface VersionInfo {
   latest: string;
   updateAvailable: boolean;
   state?: string;
+  /** OS: installed, waiting for a reboot (osPendingVersion). */
+  pending?: string;
 }
 
 interface SupInfo {
@@ -82,18 +86,41 @@ interface SupInfo {
   state?: string;
 }
 
+export interface OsInfo {
+  version?: string;
+  version_latest?: string;
+  update_available?: boolean;
+  /** HAOS: the version installed into the other slot, booted on the next reboot. */
+  version_pending?: string | null;
+  boot_slots?: Record<string, { state?: string; version?: string }>;
+}
+
+/**
+ * The newer OS version that is installed but not booted (it needs a reboot), or null. HAOS reports
+ * `update_available: false` in that state, so without this nothing would ever finish the update.
+ * Uses `version_pending`; older Supervisors: an inactive boot slot that holds `version_latest`.
+ */
+export function osPendingVersion(i: OsInfo | null | undefined): string | null {
+  if (!i?.version) return null;
+  const inactiveLatest = Object.values(i.boot_slots ?? {}).some((s) => s.state !== 'booted' && s.version === i.version_latest);
+  const pending = i.version_pending || (inactiveLatest ? i.version_latest : null);
+  return pending && pending !== i.version && versionAtLeast(pending, i.version) ? pending : null;
+}
+
 const PLATFORM_NAMES = { core: 'Home Assistant Core', os: 'Home Assistant OS', supervisor: 'Supervisor' } as const;
 
 async function readVersion(sup: SupervisorApi, t: Target): Promise<VersionInfo> {
   const path = typeof t === 'string' ? `/${t}/info` : `/addons/${t.addon}/info`;
-  const i = await sup.get<SupInfo>(path);
+  const i = await sup.get<SupInfo & OsInfo>(path);
   const name = typeof t === 'string' ? PLATFORM_NAMES[t] : (i.name ?? t.addon);
+  const pending = t === 'os' ? osPendingVersion(i) : null;
   return {
     name,
     installed: i.version ?? 'unknown',
     latest: i.version_latest ?? i.version ?? 'unknown',
     updateAvailable: i.update_available === true,
     ...(i.state !== undefined ? { state: i.state } : {}),
+    ...(pending ? { pending } : {}),
   };
 }
 
@@ -218,7 +245,9 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
   } catch (e) {
     return failed(`Could not read ${key} version info: ${errMsg(e)}`, null);
   }
-  if (!info.updateAvailable) {
+  // OS installed but not booted: finishing it = backup + one reboot.
+  const activate = !info.updateAvailable && info.pending !== undefined;
+  if (!info.updateAvailable && !activate) {
     return { status: 'done', result: `${info.name} is already up to date (${info.installed}); nothing to do.`, error: null, backupName: null };
   }
 
@@ -226,7 +255,7 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
   const busy = await waitIdle(deps);
   if (busy) return failed(`Supervisor is busy (${busy}); update of ${info.name} was not started.`, null, { transient: true });
 
-  const toVersion = info.latest;
+  const toVersion = activate ? (info.pending as string) : info.latest;
   const backupName = preUpdateBackupName(key, toVersion, deps.now());
   const base: Omit<UpdateState, 'phase'> = {
     target: key,
@@ -237,6 +266,7 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
     commandId,
     requireStarted: typeof t !== 'string' && info.state === 'started',
     auto: opts.auto === true,
+    rebootRequested: activate,
   };
   const clear = async () => deps.state.clear();
 
@@ -251,7 +281,15 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
   // 2. Update. The phase is on disk first: this call may restart HA, reboot the host, or kill us.
   deps.state.save({ ...base, phase: 'updating' });
   try {
-    await postUpdate(deps.sup, t, toVersion);
+    if (activate) {
+      if (!(await requestReboot(deps.sup))) {
+        return failed(
+          `${info.name} ${toVersion} is installed but needs a reboot, and the Supervisor offers no reboot suggestion; reboot the Pi from Home Assistant. Backup '${backupName}' was taken.`,
+          backupName,
+          { after: clear },
+        );
+      }
+    } else await postUpdate(deps.sup, t, toVersion);
   } catch (e) {
     if (!(e instanceof SupervisorError && e.kind === 'network')) {
       return failed(`Update of ${info.name} to ${toVersion} failed: ${errMsg(e)}. ${restoreHint(backupName)}`, backupName, { after: clear });
@@ -273,19 +311,40 @@ interface Suggestion {
 
 /**
  * Restart/reboot suggestions the Supervisor raised (GET /resolution/info). Only `execute_restart`, and
- * `execute_reboot` right after our own OS update, are followed; anything else is reported, not applied.
+ * `execute_reboot` right after our own OS update (unless we already rebooted for it), are followed;
+ * anything else is reported, not applied.
  */
-export async function restartSuggestions(sup: SupervisorApi, target: string): Promise<{ apply: Suggestion[]; skipped: Suggestion[] }> {
+export async function restartSuggestions(sup: SupervisorApi, target: string, rebooted = false): Promise<{ apply: Suggestion[]; skipped: Suggestion[] }> {
   try {
     const info = await sup.get<{ suggestions?: Suggestion[] }>('/resolution/info');
     const relevant = (info.suggestions ?? []).filter((s) => s.type === 'execute_restart' || s.type === 'execute_reboot');
-    const ok = (s: Suggestion) => /^[0-9a-f]{32}$/.test(s.uuid) && (s.type === 'execute_restart' || target === 'os');
+    const ok = (s: Suggestion) => /^[0-9a-f]{32}$/.test(s.uuid) && (s.type === 'execute_restart' || (target === 'os' && !rebooted));
     return { apply: relevant.filter(ok), skipped: relevant.filter((s) => !ok(s)) };
   } catch (e) {
     log.debug('GET /resolution/info failed', { error: errMsg(e) });
     return { apply: [], skipped: [] };
   }
 }
+
+/**
+ * Reboot the host through the Supervisor's `execute_reboot` suggestion (no host power endpoint is
+ * allowlisted). False when there is no such suggestion. A dropped connection means the reboot started.
+ */
+export async function requestReboot(sup: SupervisorApi): Promise<boolean> {
+  const info = await sup.get<{ suggestions?: Suggestion[] }>('/resolution/info');
+  const sg = (info.suggestions ?? []).find((s) => s.type === 'execute_reboot' && /^[0-9a-f]{32}$/.test(s.uuid));
+  if (!sg) return false;
+  log.info('Rebooting the host to boot the installed OS version', { suggestion: sg.uuid });
+  try {
+    await sup.post(`/resolution/suggestion/${sg.uuid}`, {}, { timeoutMs: 10 * 60 * 1000 });
+  } catch (e) {
+    if (!(e instanceof SupervisorError && e.kind === 'network')) throw e;
+  }
+  return true;
+}
+
+/** OS still on the old version after our update, with the new one installed: wait this long, then reboot once. */
+export const OS_REBOOT_GRACE_MS = 3 * 60 * 1000;
 
 const describeSuggestion = (s: Suggestion) => `${s.type}${s.context ? ` (${s.context}${s.reference ? ` ${s.reference}` : ''})` : ''}`;
 
@@ -297,11 +356,31 @@ async function finishVerify(deps: UpdateDeps, s: UpdateState): Promise<ExecResul
   const deadline = deps.now() + budget;
   const pollMs = deps.pollMs ?? 15_000;
   let started = false;
+  let rebooted = s.rebootRequested; // asked (or tried) once: never again
+  let rebootDone = s.rebootRequested;
+  let pendingSince: number | null = null;
   let last: Health = { ok: false, detail: 'not checked' };
   do {
     // The first probe right after an update is pointless (restarts take a moment): wait one interval.
     await deps.sleep(pollMs);
     last = await checkHealthy(deps.sup, t, s.toVersion, s.requireStarted);
+    if (!last.ok && t === 'os' && !rebooted) {
+      // Installed, but the host did not reboot into it: after a grace period, reboot once.
+      const pending = await deps.sup.get<OsInfo>('/os/info').then(osPendingVersion, () => null);
+      if (pending && versionAtLeast(pending, s.toVersion)) {
+        pendingSince ??= deps.now();
+        if (deps.now() - pendingSince >= OS_REBOOT_GRACE_MS) {
+          rebooted = true;
+          deps.state.save({ ...s, rebootRequested: true });
+          try {
+            rebootDone = await requestReboot(deps.sup);
+            if (!rebootDone) log.warn('OS update installed but there is no reboot suggestion to apply', { version: pending });
+          } catch (e) {
+            log.warn('Requesting the reboot failed', { error: errMsg(e) });
+          }
+        }
+      }
+    }
     if (!last.ok && last.addonDown && !started && typeof t !== 'string') {
       // Updated but not running: start it once.
       started = true;
@@ -322,8 +401,9 @@ async function finishVerify(deps: UpdateDeps, s: UpdateState): Promise<ExecResul
     );
   }
 
-  const sugg = await restartSuggestions(deps.sup, s.target);
+  const sugg = await restartSuggestions(deps.sup, s.target, rebooted);
   let note = started ? ' Started it once after the update.' : '';
+  if (rebootDone) note += ' Rebooted once to boot it.';
   if (sugg.apply.length) note += ` Supervisor suggested ${sugg.apply.map(describeSuggestion).join(', ')}; applied once.`;
   if (sugg.skipped.length) note += ` Supervisor suggests ${sugg.skipped.map(describeSuggestion).join(', ')}; not applied automatically.`;
   return {

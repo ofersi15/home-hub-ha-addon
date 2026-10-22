@@ -21,8 +21,8 @@ Assistant inside the Pi, and to Home Hub over HTTPS.
   Home Assistant Core, OS and Supervisor (see below).
 
 It never runs shell commands, never uses SSH, never calls the host shutdown/reboot endpoints, and
-never uninstalls anything. (An OS update reboots the Pi as part of the update; the add-on finishes
-verifying it after the reboot.)
+never uninstalls anything. (An OS update reboots the Pi as part of the update, through the
+Supervisor's own reboot suggestion when needed; the add-on finishes verifying it after the reboot.)
 
 ## Automatic updates
 
@@ -45,6 +45,8 @@ How every update runs:
 4. **Verify**: Home Assistant answers, Core is running, the new version is installed, and an add-on
    that was running is running again (it is started once if not). Up to 20 minutes for Core/OS.
    If the Supervisor then asks for a restart (or a reboot right after an OS update), it is done once.
+   An OS version that is installed but not booted yet counts as an update too: backup, one reboot,
+   verify. The add-on never reboots twice for the same update.
 5. **Result** in Home Hub. On failure the message names the backup: *restore from this backup*
    (Settings -> System -> Backups in Home Assistant).
 

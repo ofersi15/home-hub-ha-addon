@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- **OS updates reboot into the new version.** An OS version that is installed but not booted yet
+  (HAOS reports `update_available: false` with `version_pending` set; e.g. installed by another
+  automation whose reboot never happened) now shows as an update ("installed, needs a reboot") and is
+  finished like any update: auto-update for `os` on (or an approved Hub command) -> full backup first
+  -> one reboot through the Supervisor's own `execute_reboot` suggestion -> verify the new version.
+- Our own OS update that did not reboot by itself: after 3 minutes still on the old version with the
+  new one installed, the add-on asks for that reboot once.
+- Never a second reboot for the same update (`rebootRequested` is saved before asking, so a resume
+  after the reboot cannot repeat it). Booting back into the old slot fails the update with the backup
+  name. No suggestion offered -> the update fails ("reboot the Pi from Home Assistant"), no reboot.
+
 ## 0.2.0
 
 - **Auto-update everything you switch on**, including Home Assistant Core, OS and Supervisor

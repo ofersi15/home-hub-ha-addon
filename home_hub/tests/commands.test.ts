@@ -290,6 +290,7 @@ describe('CommandProcessor', () => {
       commandId: 'u1',
       requireStarted: false,
       auto: true,
+      rebootRequested: false,
     };
     const { store, sup, proc, state, results } = setup({ state: s });
     store.docs.set(PATHS.homeCommand('u1'), { ...cmd({ kind: 'update', service: null, entityId: null, target: 'core' }), status: 'claimed' });
@@ -323,6 +324,7 @@ describe('CommandProcessor', () => {
       commandId: 'other',
       requireStarted: false,
       auto: true,
+      rebootRequested: false,
     };
     const { store, sup, proc, state } = setup({ state: held });
     store.docs.set(PATHS.homeCommand('u2'), { ...cmd({ kind: 'update', service: null, entityId: null, target: 'local_threadfin' }) });

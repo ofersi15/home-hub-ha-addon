@@ -208,3 +208,26 @@ nor end an episode), so a flaky battery sensor does not re-alert. `forMinutes` a
 apart, so each lands in its own UTC bucket of `repeatHours`, which is how the Hub dedupes them. A
 rule that appears mid-episode (new rule, or a restart: `seed`) is adopted as already fired, so a
 restart never double-alerts; its next repeat comes a full period later.
+
+## D14 - OS: reboot into an installed-but-not-booted version (0.2.1)
+
+Ofer (2026-10-22): "should auto-reboot after an OS update". Found live: HAOS 18.3 installed in slot A,
+18.2 still booted, `/os/info` `update_available: false` + `version_pending: "18.3"`, Supervisor issue
+`reboot_required` / suggestion `execute_reboot`. 0.2.0 never acted on it (no update "available", and
+it only rebooted right after its own verified OS update), so the OS update would sit unbooted forever.
+
+- **Detect**: `osPendingVersion` = `version_pending` (or an inactive boot slot holding `version_latest`)
+  that is newer than the booted version. Pi status lists it as an `os` update "(installed, needs a
+  reboot)" with `updateAvailable: true`, so the normal picker/approval rules apply: auto-update for
+  `os` on, in the configured mode (Ofer: immediate), or an approved Hub command.
+- **Finish** = the normal engine with the reboot in place of the update call: lock -> Supervisor idle
+  -> full `hub-pre-update-os-<version>-...` backup -> save `rebootRequested: true` -> apply the
+  Supervisor's `execute_reboot` suggestion -> verify (20 min, resumed after the reboot).
+- **Own OS update that does not reboot**: during verify, if the OS is still on the old version and the
+  new one is pending for 3 min, reboot once the same way.
+- **Never twice**: `rebootRequested` is persisted before asking; after it, `execute_reboot` is only
+  reported. Booting back into the old slot (RAUC fallback) fails verification -> alert with the backup
+  name, 6 h backoff, 2 strikes block (D11). No suggestion -> fail without rebooting.
+- Still no `/host/reboot` in the allowlist: the reboot is always the Supervisor's own repair action for
+  a reboot it asked for, and only to boot a newer installed OS. This widens D10 ("only right after our
+  OS update") to "only to boot an OS update", which is what Ofer asked for.

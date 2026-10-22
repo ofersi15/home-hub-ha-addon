@@ -8,6 +8,7 @@ import os from 'node:os';
 import { autoUpdateEnabled, type AddonInfo, type HomeSettings, type PiStatus, type UpdateInfo } from './contract.js';
 import { errMsg, logger } from './log.js';
 import type { SupervisorApi } from './supervisor.js';
+import { osPendingVersion, type OsInfo } from './updateFlow.js';
 import { iso } from './util.js';
 
 const log = logger('pi');
@@ -94,7 +95,7 @@ export interface PiDeps {
   blocked?: (target: string) => boolean;
 }
 
-interface VersionedInfo {
+interface VersionedInfo extends OsInfo {
   version?: string;
   version_latest?: string;
   update_available?: boolean;
@@ -151,13 +152,15 @@ export async function collectPiStatus(deps: PiDeps): Promise<PiSnapshot> {
     ['supervisor', supervisor],
   ] as const) {
     if (!info?.version) continue;
-    const latest = info.version_latest ?? info.version;
+    // OS installed but not booted: still an update (finishing it = one reboot, updateFlow.ts).
+    const pending = target === 'os' ? osPendingVersion(info) : null;
+    const latest = pending ?? info.version_latest ?? info.version;
     updates.push({
       target,
-      name: PLATFORM_NAMES[target],
+      name: pending ? `${PLATFORM_NAMES[target]} (installed, needs a reboot)` : PLATFORM_NAMES[target],
       installed: info.version,
       latest,
-      updateAvailable: info.update_available === true,
+      updateAvailable: info.update_available === true || pending !== null,
       releaseNotesUrl: RELEASE_URL[target](latest),
       blocked: deps.blocked?.(target) ?? false,
     });

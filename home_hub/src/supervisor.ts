@@ -34,7 +34,8 @@ const POST_ALLOW: RegExp[] = [
   // Start an add-on once after its own update if it does not come back (updateFlow.ts).
   new RegExp(`^/addons/${SLUG}/start$`),
   // Apply a Supervisor resolution suggestion (uuid4 hex). updateFlow.ts only applies execute_restart,
-  // and execute_reboot right after our own OS update; see DECISIONS.md D10.
+  // and execute_reboot once to boot an OS update we installed or found installed-but-not-booted;
+  // see DECISIONS.md D10 and D14. No host power endpoint is allowlisted.
   /^\/resolution\/suggestion\/[0-9a-f]{32}$/,
 ];
 

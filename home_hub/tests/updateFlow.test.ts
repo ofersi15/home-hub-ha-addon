@@ -166,6 +166,7 @@ describe('runUpdate', () => {
       commandId: 'other',
       requireStarted: false,
       auto: true,
+      rebootRequested: false,
     };
     const { d, state } = deps(sup, held);
     const res = await runUpdate(d, 'core', 'cmd1');
@@ -313,6 +314,7 @@ describe('resume after a restart (each persisted phase)', () => {
     commandId: 'cmd9',
     requireStarted: false,
     auto: true,
+    rebootRequested: false,
   };
 
   it('phase backup: the update never ran -> failed, NOT attempted, no Supervisor writes, lock cleared', async () => {

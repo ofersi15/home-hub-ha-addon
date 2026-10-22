@@ -66,6 +66,14 @@ describe('collectPiStatus', () => {
     expect(snap.addonUpdates.find((a) => a.slug === 'core_mosquitto')).toEqual({ slug: 'core_mosquitto', updateAvailable: true, latest: '6.5.0' });
   });
 
+  it('an OS version installed but not booted is an update to finish (reboot)', async () => {
+    const s = sup();
+    s.gets.set('/os/info', { version: '18.2', version_latest: '18.3', version_pending: '18.3', update_available: false });
+    const snap = await collectPiStatus({ sup: s, now: () => NOW, flaps: new AddonFlapTracker(), settings: () => null, cpuTempC: () => null, cpuPercent: () => null, memoryPercent: () => null });
+    const os = PiStatus.parse(snap.status).updates.find((u) => u.target === 'os');
+    expect(os).toMatchObject({ installed: '18.2', latest: '18.3', updateAvailable: true, name: 'Home Assistant OS (installed, needs a reboot)' });
+  });
+
   it('survives Supervisor endpoints failing (nulls, no throw)', async () => {
     const snap = await collectPiStatus({ sup: new FakeSupervisor(), now: () => NOW, flaps: new AddonFlapTracker(), settings: () => null, cpuTempC: () => null, cpuPercent: () => null, memoryPercent: () => null, osUptimeSeconds: () => null });
     expect(PiStatus.parse(snap.status)).toMatchObject({ diskUsedPercent: null, updates: [], addons: [], lastBackup: null, supervisor: null });
