@@ -4,7 +4,9 @@
  *  - expired: not claimed within 10 minutes of creation/approval -> 'expired', never executed;
  *  - call_service: service in settings.services AND entity in settings.entities;
  *  - sensitive (locks, alarm, garage/gate/door covers, sirens, valves): needs a human `approvedBy`;
- *  - Core/OS/Supervisor updates: need `approvedBy: user:ofer`;
+ *  - Core/OS/Supervisor updates: a Hub command needs `approvedBy: user:ofer`; the add-on's own
+ *    auto-update (system:addon) only when settings.autoUpdate[target] === true;
+ *  - this add-on never updates or restarts itself (the Supervisor forbids self-update anyway);
  *  - only the four allowlisted kinds exist; nothing else can run.
  * Every outcome is written back on the command doc (result/error/finishedAt) = the audit trail.
  * Only transitions the Hub rules allow are used: approved -> claimed -> done | failed, or
@@ -13,6 +15,7 @@
  */
 import {
   ADDON_ACTOR,
+  autoUpdateEnabled,
   COMMAND_TTL_MS,
   HomeCommand,
   isSensitive,
@@ -26,7 +29,8 @@ import type { HaApi } from './haWs.js';
 import { errMsg, logger } from './log.js';
 import type { ClaimDecision, HubStore } from './store.js';
 import type { SupervisorApi } from './supervisor.js';
-import { parseTarget, runUpdate, type ExecResult, type UpdateDeps } from './updateFlow.js';
+import { parseTarget, resumeUpdate, runUpdate, type ExecResult, type UpdateDeps } from './updateFlow.js';
+import type { UpdateState } from './updateState.js';
 import { iso, nyParts, safeName, type Clock } from './util.js';
 
 const log = logger('commands');
@@ -39,6 +43,8 @@ export interface ValidationCtx {
   deviceClassOf: (entityId: string) => string | null;
   nowMs: number;
   selfSlug: string | null;
+  /** The add-on's own auto-update (system:addon), not a Hub command. */
+  auto?: boolean;
 }
 
 const HUMAN = /^user:(ofer|arielle)$/;
@@ -87,8 +93,17 @@ export function validateCommand(cmd: HomeCommand, ctx: ValidationCtx): Validatio
       return { ok: true };
     case 'update': {
       if (!cmd.target || !parseTarget(cmd.target)) return reject('update needs a valid target (core, os, supervisor or an add-on slug).');
+      if (cmd.target === 'self' || cmd.target === ctx.selfSlug) {
+        return reject('The Supervisor does not let an add-on update itself; update Home Hub from its add-on page in Home Assistant.');
+      }
+      if (ctx.auto) {
+        // Our own auto-update: exactly system:addon, and only for targets switched on in Settings.
+        if (cmd.requestedBy !== ADDON_ACTOR || cmd.approvedBy !== ADDON_ACTOR) return reject('Auto-update must be requested and approved by system:addon.');
+        if (!autoUpdateEnabled(ctx.settings.autoUpdate, cmd.target)) return reject(`Auto-update of ${cmd.target} is not enabled (Settings -> Home).`);
+        return { ok: true };
+      }
       if ((PLATFORM_TARGETS as readonly string[]).includes(cmd.target)) {
-        if (cmd.approvedBy !== 'user:ofer') return reject(`Updating ${cmd.target} always needs Ofer's approval.`);
+        if (cmd.approvedBy !== 'user:ofer') return reject(`Updating ${cmd.target} from Home Hub needs Ofer's approval.`);
       } else if (cmd.sensitive && !hasHumanApproval(cmd)) {
         return reject('Sensitive command without human approval.');
       }
@@ -127,11 +142,14 @@ export interface ProcessorDeps {
   now: Clock;
   /** Called after each executed command (refresh Pi status). */
   afterCommand?: (cmd: HomeCommand) => void;
+  /** Every finished update (Hub command, auto-update, or resumed after a restart). */
+  onUpdateResult?: (target: string, res: ExecResult, auto: boolean) => void;
 }
 
 export class CommandProcessor {
   private chain: Promise<void> = Promise.resolve();
   private queued = new Set<string>();
+  private pending = 0;
 
   constructor(private readonly deps: ProcessorDeps) {}
 
@@ -155,11 +173,22 @@ export class CommandProcessor {
   }
 
   private enqueue(fn: () => Promise<void>): void {
-    this.chain = this.chain.then(fn).catch((e) => log.error('Command handling crashed', { error: errMsg(e) }));
+    this.pending++;
+    this.chain = this.chain
+      .then(fn)
+      .catch((e) => log.error('Command handling crashed', { error: errMsg(e) }))
+      .finally(() => {
+        this.pending--;
+      });
   }
 
-  private ctx(settings: HomeSettings): ValidationCtx {
-    return { settings, deviceClassOf: this.deps.deviceClassOf, nowMs: this.deps.now(), selfSlug: this.deps.selfSlug() };
+  /** True while something is queued or running. */
+  get busy(): boolean {
+    return this.pending > 0;
+  }
+
+  private ctx(settings: HomeSettings, auto = false): ValidationCtx {
+    return { settings, deviceClassOf: this.deps.deviceClassOf, nowMs: this.deps.now(), selfSlug: this.deps.selfSlug(), auto };
   }
 
   async handle(id: string): Promise<void> {
@@ -208,13 +237,38 @@ export class CommandProcessor {
     if (claimed) await this.runClaimed(id, claimed);
   }
 
-  private async runClaimed(id: string, cmd: HomeCommand): Promise<ExecResult> {
+  private async runClaimed(id: string, cmd: HomeCommand, auto = false): Promise<ExecResult> {
     log.info('Running command', { id, kind: cmd.kind, service: cmd.service, entityId: cmd.entityId, target: cmd.target, requestedBy: cmd.requestedBy });
-    const res = await this.execute(cmd, id);
-    await this.finish(id, res);
-    log.info('Command finished', { id, status: res.status, result: res.result, error: res.error });
+    const res = await this.execute(cmd, id, auto);
+    await this.complete(id, res, cmd.kind === 'update' ? (cmd.target as string) : null, auto);
     this.deps.afterCommand?.(cmd);
     return res;
+  }
+
+  /** Outcome -> command doc, THEN the result's follow-up (clear the update lock, restart suggestions). */
+  private async complete(id: string | null, res: ExecResult, updateTarget: string | null, auto: boolean): Promise<void> {
+    if (id) await this.finish(id, res);
+    log.info('Command finished', { id, status: res.status, result: res.result, error: res.error });
+    if (updateTarget) this.deps.onUpdateResult?.(updateTarget, res, auto);
+    if (res.after) {
+      try {
+        await res.after();
+      } catch (e) {
+        log.warn('Post-command step failed', { id, error: errMsg(e) });
+      }
+    }
+  }
+
+  /** On startup: finish an update that was in flight when we last stopped. Runs exclusively. */
+  resume(state: UpdateState): Promise<ExecResult> {
+    return new Promise((resolve) => {
+      this.enqueue(async () => {
+        log.info('Resuming an in-flight update', { target: state.target, toVersion: state.toVersion, phase: state.phase });
+        const res = await resumeUpdate(this.deps.update, state);
+        await this.complete(state.commandId, res, state.target, state.auto);
+        resolve(res);
+      });
+    });
   }
 
   async finish(id: string, res: ExecResult): Promise<void> {
@@ -231,7 +285,7 @@ export class CommandProcessor {
     log.error('Giving up writing command result', { id });
   }
 
-  async execute(cmd: HomeCommand, id: string | null): Promise<ExecResult> {
+  async execute(cmd: HomeCommand, id: string | null, auto = false): Promise<ExecResult> {
     const ok = (result: string, backupName: string | null = null): ExecResult => ({ status: 'done', result, error: null, backupName });
     const fail = (error: string, backupName: string | null = null): ExecResult => ({ status: 'failed', result: null, error: error.slice(0, 2000), backupName });
     try {
@@ -252,7 +306,7 @@ export class CommandProcessor {
           }
         }
         case 'update':
-          return await runUpdate(this.deps.update, cmd.target as string, id);
+          return await runUpdate(this.deps.update, cmd.target as string, id, { auto });
         case 'restart_addon':
           await this.deps.sup.post(`/addons/${cmd.target as string}/restart`, {}, { timeoutMs: 5 * 60 * 1000 });
           return ok(`Restarted add-on ${cmd.target}.`);
@@ -293,7 +347,7 @@ export class CommandProcessor {
           error: null,
           backupName: null,
         };
-        const v = validateCommand(cmd, this.ctx(settings));
+        const v = validateCommand(cmd, this.ctx(settings, true));
         if (!v.ok) {
           log.warn('Auto-update refused by validation', { slug, error: v.error });
           return resolve(null);
@@ -306,7 +360,7 @@ export class CommandProcessor {
           return resolve(null);
         }
         try {
-          resolve(await this.runClaimed(id, cmd));
+          resolve(await this.runClaimed(id, cmd, true));
         } catch (e) {
           log.error('Auto-update crashed', { slug, error: errMsg(e) });
           resolve(null);

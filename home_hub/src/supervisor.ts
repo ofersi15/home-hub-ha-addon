@@ -9,6 +9,8 @@
 import http from 'node:http';
 
 const SLUG = '[a-z0-9_]+';
+/** Supervisor backup slugs: first 8 hex chars of a sha1. */
+const BACKUP_SLUG = '[0-9a-f]{8}';
 
 const GET_ALLOW: RegExp[] = [
   /^\/info$/,
@@ -19,6 +21,8 @@ const GET_ALLOW: RegExp[] = [
   /^\/addons$/,
   new RegExp(`^/addons/${SLUG}/(info|stats)$`),
   /^\/backups$/,
+  new RegExp(`^/backups/${BACKUP_SLUG}/info$`),
+  /^\/jobs\/info$/,
   /^\/jobs\/[0-9a-f-]{8,64}$/,
 ];
 
@@ -27,13 +31,23 @@ const POST_ALLOW: RegExp[] = [
   /^\/(core|os|supervisor)\/update$/,
   new RegExp(`^/store/addons/${SLUG}/update$`),
   new RegExp(`^/addons/${SLUG}/restart$`),
+  // Start an add-on once after its own update if it does not come back (updateFlow.ts).
+  new RegExp(`^/addons/${SLUG}/start$`),
+  // Apply a Supervisor resolution suggestion (uuid4 hex). updateFlow.ts only applies execute_restart,
+  // and execute_reboot right after our own OS update; see DECISIONS.md D10.
+  /^\/resolution\/suggestion\/[0-9a-f]{32}$/,
 ];
+
+/** Retention of our own 'hub-' backups only (retention.ts checks the name via /backups/<slug>/info first). */
+const DELETE_ALLOW: RegExp[] = [new RegExp(`^/backups/${BACKUP_SLUG}$`)];
 
 /** HA Core REST (proxied by the Supervisor at /core/api/...). Read-only probes only. */
 const CORE_GET_ALLOW: RegExp[] = [/^\/api\/$/, /^\/api\/config$/];
 
-export function isAllowed(method: 'GET' | 'POST', path: string): boolean {
-  const list = method === 'GET' ? GET_ALLOW : POST_ALLOW;
+export type Method = 'GET' | 'POST' | 'DELETE';
+
+export function isAllowed(method: Method, path: string): boolean {
+  const list = method === 'GET' ? GET_ALLOW : method === 'POST' ? POST_ALLOW : DELETE_ALLOW;
   return list.some((re) => re.test(path));
 }
 
@@ -52,6 +66,7 @@ export class SupervisorError extends Error {
 export interface SupervisorApi {
   get<T = Record<string, unknown>>(path: string): Promise<T>;
   post<T = Record<string, unknown>>(path: string, body?: unknown, opts?: { timeoutMs?: number }): Promise<T>;
+  del<T = Record<string, unknown>>(path: string): Promise<T>;
   /** GET on HA Core's REST API via the Supervisor proxy (e.g. '/api/'). Returns the raw JSON. */
   core<T = Record<string, unknown>>(path: string): Promise<T>;
 }
@@ -91,7 +106,7 @@ function request(host: string, token: string, method: string, path: string, body
 }
 
 export function createSupervisorClient(token: string, host = 'supervisor'): SupervisorApi {
-  const call = async <T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number): Promise<T> => {
+  const call = async <T>(method: Method, path: string, body: unknown, timeoutMs: number): Promise<T> => {
     if (!isAllowed(method, path)) throw new SupervisorError(`${method} ${path} is not allowlisted in this add-on`, 'denied');
     const res = await request(host, token, method, path, body, timeoutMs);
     let json: { result?: string; message?: string; data?: unknown } = {};
@@ -108,6 +123,7 @@ export function createSupervisorClient(token: string, host = 'supervisor'): Supe
   return {
     get: (path) => call('GET', path, undefined, 60_000),
     post: (path, body, opts) => call('POST', path, body ?? {}, opts?.timeoutMs ?? 60_000),
+    del: (path) => call('DELETE', path, undefined, 60_000),
     core: async <T>(path: string): Promise<T> => {
       if (!CORE_GET_ALLOW.some((re) => re.test(path))) throw new SupervisorError(`core GET ${path} is not allowlisted`, 'denied');
       const res = await request(host, token, 'GET', `/core${path}`, undefined, 30_000);

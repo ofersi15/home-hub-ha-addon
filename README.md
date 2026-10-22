@@ -5,6 +5,8 @@ Home Assistant OS install (Raspberry Pi 4, aarch64; amd64 also built) to Home Hu
 
 - mirrors allowlisted entities and a catalog of all entities,
 - runs approved, allowlisted commands (service calls, backups, updates, add-on restarts),
+- auto-updates what you switch on (add-ons, Supervisor, Core, OS) one at a time: backup first,
+  verified across restarts and reboots, with retention for its own `hub-` backups,
 - reports Pi health, available updates and add-on states,
 - evaluates simple event rules ("door open 10 min", "washer done").
 

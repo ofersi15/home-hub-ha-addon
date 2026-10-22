@@ -51,6 +51,7 @@ export class FakeSupervisor implements SupervisorApi {
   gets = new Map<string, Handler>();
   posts = new Map<string, Handler>();
   cores = new Map<string, Handler>();
+  dels = new Map<string, Handler>();
 
   private resolve(map: Map<string, Handler>, method: string, path: string, body?: unknown): unknown {
     if (!map.has(path)) throw new SupervisorError(`${method} ${path}: not mocked`, 'api', 404);
@@ -68,12 +69,20 @@ export class FakeSupervisor implements SupervisorApi {
     this.calls.push({ method: 'POST', path, body });
     return this.resolve(this.posts, 'POST', path, body) as T;
   }
+  async del<T>(path: string): Promise<T> {
+    if (!isAllowed('DELETE', path)) throw new SupervisorError('DELETE ' + path + ' not allowlisted', 'denied');
+    this.calls.push({ method: 'DELETE', path });
+    return this.resolve(this.dels, 'DELETE', path) as T;
+  }
   async core<T>(path: string): Promise<T> {
     this.calls.push({ method: 'CORE', path });
     return this.resolve(this.cores, 'CORE', path) as T;
   }
   posted(): string[] {
     return this.calls.filter((c) => c.method === 'POST').map((c) => c.path);
+  }
+  deleted(): string[] {
+    return this.calls.filter((c) => c.method === 'DELETE').map((c) => c.path);
   }
 }
 

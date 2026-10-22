@@ -14,13 +14,56 @@ Assistant inside the Pi, and to Home Hub over HTTPS.
   the add-on refuses them otherwise, even if Home Hub asked.
 - **Reports Pi health**: CPU temperature, disk, memory, uptime, available updates (with release notes
   links), add-on states and crash-loops, last backup.
-- **Event rules**: e.g. "washer power off" or "door open for 10 minutes" -> push or task in Home Hub.
-- **Scheduled add-on updates** inside your update window, for the add-ons you opt in. Core, OS and
-  Supervisor are never updated automatically.
+- **Event rules**: e.g. "washer power off", "door open for 10 minutes" or "blinds battery below 20"
+  -> push or task in Home Hub. Numeric rules ignore `unknown`/`unavailable`; `repeatHours` re-sends
+  the alert at most once per N hours while the condition lasts (0 = once).
+- **Automatic updates with a backup first** for everything you switch on in Home Hub, including
+  Home Assistant Core, OS and Supervisor (see below).
 
 It never runs shell commands, never uses SSH, never calls the host shutdown/reboot endpoints, and
-never uninstalls anything. (An OS update you approve reboots the Pi as part of the update; the
-add-on finishes verifying it after the reboot.)
+never uninstalls anything. (An OS update reboots the Pi as part of the update; the add-on finishes
+verifying it after the reboot.)
+
+## Automatic updates
+
+Set in Home Hub -> Settings -> Home:
+
+- **Which**: per target (Core, OS, Supervisor, each add-on) or "All add-ons". Core, OS and Supervisor
+  are only auto-updated when their own switch is on ("All add-ons" never covers them).
+- **When**: *Immediately* (the add-on checks every 5 minutes and starts as soon as it sees an update)
+  or *In the update window* (default 03:00-05:00 New York time).
+
+How every update runs:
+
+1. **One at a time.** If several are pending they go in this order: add-ons, then Supervisor, then
+   Core, then OS. Nothing starts while the Supervisor is busy (a backup or another job).
+2. **Backup first, always**: `hub-pre-update-<target>-<version>-<yyyymmdd-hhmm>`. Full backup for
+   Core/OS/Supervisor, a backup of just that add-on otherwise. If the backup fails, the update is not
+   attempted and Home Hub shows "Backup failed".
+3. **Update.** Core restarts Home Assistant, OS reboots the Pi, Supervisor restarts itself. The add-on
+   saves its progress first and picks up where it left off when it starts again.
+4. **Verify**: Home Assistant answers, Core is running, the new version is installed, and an add-on
+   that was running is running again (it is started once if not). Up to 20 minutes for Core/OS.
+   If the Supervisor then asks for a restart (or a reboot right after an OS update), it is done once.
+5. **Result** in Home Hub. On failure the message names the backup: *restore from this backup*
+   (Settings -> System -> Backups in Home Assistant).
+
+Safety nets: after a failure the same update waits at least 6 hours; after 2 failures in a row
+auto-update stops for that target (shown as *blocked*) until you press **Retry** in Home Hub.
+
+The Home Hub add-on cannot update itself (the Supervisor does not allow it). Update it from its page
+in Home Assistant (Settings -> Add-ons -> Home Hub -> Update), or switch on that page's own
+**Auto update** toggle.
+
+## Backups and retention
+
+The add-on keeps the newest **5** backups it created (names starting `hub-`; change the number in
+Home Hub, 2-30) and deletes older ones after each successful update and once a day. Backups with
+any other name (yours, Home Assistant's automatic ones) are never deleted. A backup named in a
+failed update is kept until that failure is cleared.
+
+If you still have a Home Assistant automation that forces updates at night, turn it off: the two
+would race each other.
 
 ## Install
 
@@ -48,9 +91,10 @@ To pair again (for example after removing the device in Home Hub), put a NEW cod
 ## Permissions it asks for, and why
 
 - `homeassistant_api` - read states, subscribe to state changes, call allowlisted services.
-- `hassio_api` with role `manager` - the lowest Supervisor role that can list add-ons, create
-  backups, update Core/OS/Supervisor/add-ons and restart add-ons. On top of that the add-on has its
-  own allowlist of Supervisor paths and refuses everything else.
+- `hassio_api` with role `manager` - the lowest Supervisor role that can list add-ons, create and
+  delete backups, update Core/OS/Supervisor/add-ons, start/restart add-ons and apply Supervisor
+  repair suggestions. On top of that the add-on has its own allowlist of exact Supervisor paths and
+  refuses everything else (only backups named `hub-...` are ever deleted).
 
 Pairing data lives only in the add-on's private `/data` folder and is never written to the log.
 

@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { CommandProcessor, backupNameFor, isSensitiveCommand, serviceData, validateCommand, type ValidationCtx } from '../src/commands.js';
 import { HomeCommand, HomeSettings, PATHS } from '../src/contract.js';
 import type { HaApi } from '../src/haWs.js';
-import type { UpdateDeps } from '../src/updateFlow.js';
+import type { ExecResult, UpdateDeps } from '../src/updateFlow.js';
+import { memoryUpdateStateStore, type UpdateState } from '../src/updateState.js';
 import { FakeStore, FakeSupervisor, fakeTime } from './fakes.js';
 
 const NOW = Date.parse('2026-10-22T12:00:00Z');
@@ -89,6 +90,30 @@ describe('validateCommand: expiry and kinds', () => {
     );
     expect(v.ok).toBe(true);
   });
+  it('auto-update (system:addon): platform only when its own flag is on; add-ons via * too; never self', () => {
+    const auto = (target: string, autoUpdate: Record<string, boolean>, over: Partial<HomeCommand> = {}) =>
+      validateCommand(
+        cmd({ kind: 'update', service: null, entityId: null, target, requestedBy: 'system:addon', approvedBy: 'system:addon', ...over }),
+        ctx({ auto: true, settings: HomeSettings.parse({ autoUpdate }) }),
+      ).ok;
+    expect(auto('core', { core: true })).toBe(true);
+    expect(auto('os', { os: true })).toBe(true);
+    expect(auto('core', { '*': true })).toBe(false);
+    expect(auto('core', {})).toBe(false);
+    expect(auto('core_mosquitto', { '*': true })).toBe(true);
+    expect(auto('core_mosquitto', { '*': true, core_mosquitto: false })).toBe(false);
+    expect(auto('abc123_home_hub', { '*': true })).toBe(false);
+    expect(auto('core', { core: true }, { approvedBy: 'user:arielle' })).toBe(false);
+  });
+  it('a Hub command approved by system:addon never passes as a platform update', () => {
+    const c = cmd({ kind: 'update', service: null, entityId: null, target: 'core', requestedBy: 'system:addon', approvedBy: 'system:addon' });
+    expect(validateCommand(c, ctx({ settings: HomeSettings.parse({ autoUpdate: { core: true } }) })).ok).toBe(false);
+  });
+  it('never updates itself (the Supervisor forbids it)', () => {
+    const v = validateCommand(cmd({ kind: 'update', service: null, entityId: null, target: 'abc123_home_hub', approvedBy: 'user:ofer' }), ctx());
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.error).toContain('update itself');
+  });
   it('core/os/supervisor updates need Ofer', () => {
     const base = { kind: 'update' as const, service: null, entityId: null, target: 'core' };
     expect(validateCommand(cmd({ ...base }), ctx()).ok).toBe(false);
@@ -116,10 +141,12 @@ describe('helpers', () => {
   });
 });
 
-function setup() {
+function setup(opts: { settings?: HomeSettings; state?: UpdateState | null } = {}) {
   const store = new FakeStore();
   const sup = new FakeSupervisor();
   const time = fakeTime(NOW);
+  const state = memoryUpdateStateStore(opts.state ?? null);
+  const results: { target: string; res: ExecResult; auto: boolean }[] = [];
   const calls: unknown[][] = [];
   const ha: HaApi = {
     callService: async (...args) => {
@@ -128,18 +155,19 @@ function setup() {
     getStates: async () => [],
     getRegistry: async () => ({ areas: [], devices: [], entities: [] }),
   };
-  const update: UpdateDeps = { sup, sleep: time.sleep, now: time.now, saveInflight: vi.fn(), clearInflight: vi.fn(), pollMs: 1000 };
+  const update: UpdateDeps = { sup, sleep: time.sleep, now: time.now, state, pollMs: 1000 };
   const proc = new CommandProcessor({
     store,
     ha,
     sup,
     update,
-    settings: () => settings,
+    settings: () => opts.settings ?? settings,
     deviceClassOf: (id) => classes[id] ?? null,
     selfSlug: () => 'abc123_home_hub',
     now: time.now,
+    onUpdateResult: (target, res, auto) => results.push({ target, res, auto }),
   });
-  return { store, sup, time, calls, proc };
+  return { store, sup, time, calls, proc, state, results };
 }
 
 describe('CommandProcessor', () => {
@@ -210,7 +238,7 @@ describe('CommandProcessor', () => {
   });
 
   it('auto-update creates an audited command as system:addon, then runs it', async () => {
-    const { store, sup, proc } = setup();
+    const { store, sup, proc } = setup({ settings: HomeSettings.parse({ autoUpdate: { '*': true } }) });
     sup.gets.set('/addons/a0d7b954_vscode/info', { name: 'Studio Code Server', version: '5.0.0', version_latest: '5.1.0', update_available: false });
     const res = await proc.runLocalUpdate('a0d7b954_vscode');
     expect(res?.status).toBe('done');
@@ -220,18 +248,89 @@ describe('CommandProcessor', () => {
   });
 
   it('auto-update does nothing if the command cannot be recorded (audit first)', async () => {
-    const { store, sup, proc } = setup();
+    const { store, sup, proc } = setup({ settings: HomeSettings.parse({ autoUpdate: { '*': true } }) });
     store.failAdd = true;
     const res = await proc.runLocalUpdate('a0d7b954_vscode');
     expect(res).toBeNull();
     expect(sup.calls).toHaveLength(0);
   });
 
-  it('auto-update never touches core', async () => {
+  it('auto-update never touches core unless autoUpdate.core is on', async () => {
     const { store, sup, proc } = setup();
     const res = await proc.runLocalUpdate('core');
     expect(res).toBeNull();
     expect(sup.calls).toHaveLength(0);
     expect(store.writes).toHaveLength(0);
+  });
+
+  it('auto-update of core when enabled: audited command, result reported as auto', async () => {
+    const { store, sup, proc, results } = setup({ settings: HomeSettings.parse({ autoUpdate: { core: true } }) });
+    sup.gets.set('/core/info', { version: '2026.11.0', version_latest: '2026.11.0', update_available: false });
+    const res = await proc.runLocalUpdate('core');
+    expect(res?.status).toBe('done');
+    expect(store.writes.find((w) => w.op === 'add')?.data).toMatchObject({
+      kind: 'update',
+      target: 'core',
+      requestedBy: 'system:addon',
+      approvedBy: 'system:addon',
+      status: 'claimed',
+      sensitive: false,
+    });
+    expect(results).toEqual([expect.objectContaining({ target: 'core', auto: true })]);
+  });
+
+  it('resume after a restart: writes the outcome to the command doc BEFORE clearing the lock', async () => {
+    const s: UpdateState = {
+      target: 'core',
+      fromVersion: '2026.10.2',
+      toVersion: '2026.11.0',
+      backupName: 'hub-pre-update-core-2026.11.0-20261022-0300',
+      phase: 'verifying',
+      startedAt: NOW - 600_000,
+      commandId: 'u1',
+      requireStarted: false,
+      auto: true,
+    };
+    const { store, sup, proc, state, results } = setup({ state: s });
+    store.docs.set(PATHS.homeCommand('u1'), { ...cmd({ kind: 'update', service: null, entityId: null, target: 'core' }), status: 'claimed' });
+    sup.cores.set('/api/', { message: 'API running.' });
+    sup.cores.set('/api/config', { state: 'RUNNING' });
+    sup.gets.set('/info', { state: 'running' });
+    sup.gets.set('/core/info', { version: '2026.11.0', state: 'running' });
+    sup.gets.set('/resolution/info', { suggestions: [] });
+    let lockWhenWritten: UpdateState | null | undefined;
+    const update = store.update.bind(store);
+    store.update = async (path, fields) => {
+      lockWhenWritten = state.load();
+      return update(path, fields);
+    };
+    const res = await proc.resume(s);
+    expect(res.status).toBe('done');
+    expect(store.docs.get(PATHS.homeCommand('u1'))).toMatchObject({ status: 'done', backupName: s.backupName });
+    expect(lockWhenWritten?.phase).toBe('verifying');
+    expect(state.load()).toBeNull();
+    expect(results).toEqual([expect.objectContaining({ target: 'core', auto: true })]);
+  });
+
+  it('a Hub update command while the lock is held fails without touching the Supervisor', async () => {
+    const held: UpdateState = {
+      target: 'os',
+      fromVersion: '16.2',
+      toVersion: '16.3',
+      backupName: 'hub-x',
+      phase: 'updating',
+      startedAt: NOW,
+      commandId: 'other',
+      requireStarted: false,
+      auto: true,
+    };
+    const { store, sup, proc, state } = setup({ state: held });
+    store.docs.set(PATHS.homeCommand('u2'), { ...cmd({ kind: 'update', service: null, entityId: null, target: 'local_threadfin' }) });
+    proc.onApproved(['u2']);
+    await proc.idle();
+    expect(store.docs.get(PATHS.homeCommand('u2'))).toMatchObject({ status: 'failed' });
+    expect(String(store.docs.get(PATHS.homeCommand('u2'))?.error)).toContain('Another update is in progress');
+    expect(sup.posted()).toEqual([]);
+    expect(state.load()).toEqual(held);
   });
 });

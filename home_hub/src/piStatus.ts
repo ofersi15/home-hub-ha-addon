@@ -5,7 +5,7 @@
  */
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
-import type { AddonInfo, HomeSettings, PiStatus, UpdateInfo } from './contract.js';
+import { autoUpdateEnabled, type AddonInfo, type HomeSettings, type PiStatus, type UpdateInfo } from './contract.js';
 import { errMsg, logger } from './log.js';
 import type { SupervisorApi } from './supervisor.js';
 import { iso } from './util.js';
@@ -90,6 +90,8 @@ export interface PiDeps {
   cpuPercent: () => number | null;
   memoryPercent?: () => number | null;
   osUptimeSeconds?: () => number | null;
+  /** Auto-update stopped for this target after 2 consecutive failures (PiStatus.updates[].blocked). */
+  blocked?: (target: string) => boolean;
 }
 
 interface VersionedInfo {
@@ -157,6 +159,7 @@ export async function collectPiStatus(deps: PiDeps): Promise<PiSnapshot> {
       latest,
       updateAvailable: info.update_available === true,
       releaseNotesUrl: RELEASE_URL[target](latest),
+      blocked: deps.blocked?.(target) ?? false,
     });
   }
 
@@ -180,12 +183,20 @@ export async function collectPiStatus(deps: PiDeps): Promise<PiSnapshot> {
       version,
       updateAvailable,
       recentRestarts: deps.flaps.recentRestarts(a.slug, nowMs),
-      autoUpdatePolicy: settings?.autoUpdate[a.slug] === true ? 'auto' : 'off',
+      autoUpdatePolicy: settings && autoUpdateEnabled(settings.autoUpdate, a.slug) ? 'auto' : 'off',
       boot: mapBoot(info?.boot),
     });
     addonUpdates.push({ slug: a.slug, updateAvailable, latest });
     if (updateAvailable) {
-      updates.push({ target: a.slug, name: a.name, installed: version, latest, updateAvailable, releaseNotesUrl: info?.url ?? null });
+      updates.push({
+        target: a.slug,
+        name: a.name,
+        installed: version,
+        latest,
+        updateAvailable,
+        releaseNotesUrl: info?.url ?? null,
+        blocked: deps.blocked?.(a.slug) ?? false,
+      });
     }
   }
 

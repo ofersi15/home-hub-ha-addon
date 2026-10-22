@@ -64,6 +64,11 @@ export const UpdateInfo = z.object({
   latest: z.string(),
   updateAvailable: z.boolean(),
   releaseNotesUrl: z.string().nullable().default(null),
+  /**
+   * Auto-update of this target stopped after 2 consecutive failures; it stays stopped until a household
+   * member presses Retry (settings.autoUpdateRetry[target] newer than the last failure).
+   */
+  blocked: z.boolean().default(false),
 });
 export type UpdateInfo = z.infer<typeof UpdateInfo>;
 
@@ -130,17 +135,36 @@ export const HomeCommand = z.object({
 });
 export type HomeCommand = z.infer<typeof HomeCommand>;
 
-export const HomeEventRule = z.object({
-  id: z.string().regex(/^[a-z0-9_-]{2,40}$/),
-  name: z.string().max(100),
-  entityId: EntityId,
-  toState: z.string().max(100),
-  forMinutes: z.number().int().min(0).max(1440).default(0),
-  action: z.enum(['notify', 'task']),
-  message: z.string().max(200),
-  enabled: z.boolean().default(true),
-});
+export const HomeEventRule = z
+  .object({
+    id: z.string().regex(/^[a-z0-9_-]{2,40}$/),
+    name: z.string().max(100),
+    entityId: EntityId,
+    /** Fire when the entity enters this state (e.g. 'off' for washer power, 'on' for door contact). */
+    toState: z.string().max(100).nullable().default(null),
+    /** ...or (numeric sensors) when the state drops below this value, e.g. blinds battery < 20. */
+    below: z.number().nullable().default(null),
+    /** ...and stays there this long (0 = immediately). */
+    forMinutes: z.number().int().min(0).max(1440).default(0),
+    /** Re-fire at most once per this many hours while the condition holds (0 = once per transition). */
+    repeatHours: z.number().int().min(0).max(168).default(0),
+    action: z.enum(['notify', 'task']),
+    message: z.string().max(200),
+    enabled: z.boolean().default(true),
+  })
+  .refine((r) => (r.toState !== null) !== (r.below !== null), { message: 'Set exactly one of toState or below' });
 export type HomeEventRule = z.infer<typeof HomeEventRule>;
+
+/** A named set of lights/switches toggled together (Hub UI only; the add-on just accepts it). */
+export const HomeGroup = z.object({
+  id: z.string().regex(/^[a-z0-9_-]{2,40}$/),
+  name: z.string().min(1).max(60),
+  entities: z.array(EntityId).min(1).max(100),
+});
+export type HomeGroup = z.infer<typeof HomeGroup>;
+
+/** Update targets: 'core' | 'os' | 'supervisor' | an add-on slug. */
+export const AUTO_UPDATE_PLATFORM_TARGETS = ['core', 'os', 'supervisor'] as const;
 
 export const HomeEvent = z.object({
   ruleId: z.string(),
@@ -154,10 +178,24 @@ export type HomeEvent = z.infer<typeof HomeEvent>;
 export const HomeSettings = z.object({
   entities: z.array(EntityId).max(200).default([]),
   pinned: z.array(EntityId).max(30).default([]),
+  /** Hub UI only: HomeGroup ids pinned on Today. */
+  pinnedGroups: z.array(z.string().regex(/^[a-z0-9_-]{2,40}$/)).max(20).default([]),
   services: z.array(ServiceName).max(100).default(['light.turn_on', 'light.turn_off', 'switch.turn_on', 'switch.turn_off']),
   rules: z.array(HomeEventRule).max(50).default([]),
+  /** Hub UI only (group switches). */
+  groups: z.array(HomeGroup).max(20).default([]),
+  /** Hub UI only (entities whose actions always ask for confirmation). */
+  confirm: z.array(EntityId).max(100).default([]),
+  /** Auto-update per target ('core' | 'os' | 'supervisor' | add-on slug); '*' = all add-ons. */
   autoUpdate: z.record(z.string(), z.boolean()).default({}),
+  /** Retry requests for blocked auto-updates: target -> ISO time Retry was pressed (newer than the last failure = unblock). */
+  autoUpdateRetry: z.record(z.string(), IsoDateTime).default({}),
+  /** 'immediate' = as soon as the 5-minute poll sees an update (one at a time); 'window' = only inside autoUpdateWindow. */
+  autoUpdateMode: z.enum(['immediate', 'window']).default('window'),
+  /** Local time window (NY) for auto-updates in 'window' mode. */
   autoUpdateWindow: z.object({ start: z.string(), end: z.string() }).default({ start: '03:00', end: '05:00' }),
+  /** Keep this many add-on-created backups (names starting 'hub-'); older ones are deleted. Never touches other backups. */
+  backupRetention: z.number().int().min(2).max(30).default(5),
   alerts: z
     .object({ diskPercent: z.number().default(85), cpuTempC: z.number().default(80), offlineMinutes: z.number().default(10) })
     .default({ diskPercent: 85, cpuTempC: 80, offlineMinutes: 10 }),
@@ -205,9 +243,19 @@ export const HomeTokenResponse = z.object({
 });
 export type HomeTokenResponse = z.infer<typeof HomeTokenResponse>;
 
-/** Updates that always need Ofer's explicit approval (never auto-updated). */
-export const CORE_UPDATE_TARGETS = ['core', 'os', 'supervisor'] as const;
+/** Platform targets: a Hub command needs Ofer's approval; auto-update only when settings.autoUpdate[target] === true. */
+export const CORE_UPDATE_TARGETS = AUTO_UPDATE_PLATFORM_TARGETS;
 export const isCoreTarget = (target: string) => (CORE_UPDATE_TARGETS as readonly string[]).includes(target);
+
+/**
+ * Is auto-update on for this target? Platform targets: only their own flag. Add-ons: their own flag when
+ * set (an explicit `false` overrides "All add-ons"), else `autoUpdate['*']`. Same as the Hub helper.
+ */
+export function autoUpdateEnabled(autoUpdate: Record<string, boolean>, target: string): boolean {
+  if (isCoreTarget(target)) return autoUpdate[target] === true;
+  const own = autoUpdate[target];
+  return own !== undefined ? own === true : autoUpdate['*'] === true;
+}
 
 // ---- Firestore paths (shared/paths.ts: everything under hub/main) ----
 export const HUB = 'hub/main';
@@ -227,5 +275,5 @@ export const PATHS = {
 export const COMMAND_TTL_MS = 10 * 60 * 1000;
 /** Our own actor id for locally created (auto-update) commands. */
 export const ADDON_ACTOR = 'system:addon';
-/** Update targets that are never auto-updated and always need a human (Ofer) approval. */
+/** Core/OS/Supervisor: Hub commands need Ofer; auto-update only when explicitly enabled per target ('*' never covers them). */
 export const PLATFORM_TARGETS = CORE_UPDATE_TARGETS;

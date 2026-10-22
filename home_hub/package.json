@@ -1,6 +1,6 @@
 {
   "name": "home-hub-ha-addon",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Home Assistant add-on that connects HA and the Supervisor to Home Hub (outbound only).",
   "license": "MIT",

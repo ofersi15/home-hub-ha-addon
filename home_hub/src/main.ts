@@ -2,22 +2,30 @@
  * Home Hub add-on entry point. Outbound only: Supervisor API + HA WebSocket (both via the internal
  * `supervisor` host) and HTTPS/gRPC to Home Hub (Firebase). No ports, no shell, no SSH.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { pickAutoUpdates } from './autoUpdate.js';
+import {
+  applyHumanResets,
+  historyStore,
+  isBlocked,
+  pickAutoUpdate,
+  protectedBackups,
+  recordOutcome,
+  RETENTION_EVERY_MS,
+  type UpdateCandidate,
+} from './autoUpdate.js';
 import { CommandProcessor } from './commands.js';
 import { ADDON_VERSION, DATA_DIR, FatalConfigError, loadOptions } from './config.js';
 import { HomeSettings, PATHS, type HomeState } from './contract.js';
 import { FirestoreHubStore, HubSession } from './firestoreStore.js';
 import { HaWebSocket, type HaRegistry } from './haWs.js';
-import { inflightStore } from './inflight.js';
 import { errMsg, logger, registerSecret } from './log.js';
 import { EntityMirror } from './mirror.js';
 import { ensurePaired } from './pairing.js';
 import { AddonFlapTracker, collectPiStatus, cpuSampler, readSysCpuTemp, sampleAddonStates } from './piStatus.js';
+import { pruneBackups } from './retention.js';
 import { RuleEngine } from './rules.js';
 import { createSupervisorClient } from './supervisor.js';
-import { resumeInflight, type UpdateDeps } from './updateFlow.js';
+import { supervisorBusy, type UpdateDeps } from './updateFlow.js';
+import { fileUpdateStateStore } from './updateState.js';
 import { iso, retryForever, sleep } from './util.js';
 
 const log = logger('main');
@@ -25,31 +33,12 @@ const log = logger('main');
 const HEARTBEAT_MS = 60_000;
 const PI_STATUS_MS = 5 * 60_000;
 const CATALOG_MS = 6 * 60 * 60_000;
+/** After the Hub refuses an auto-update's audit doc, leave that target alone this long. */
+const AUDIT_REFUSED_PAUSE_MS = 60 * 60_000;
 const CPU_TEMP_SENSORS = ['sensor.processor_temperature', 'sensor.cpu_temperature', 'sensor.system_monitor_processor_temperature'];
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
   return Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), ms))]);
-}
-
-function attemptedStore(dir: string) {
-  const file = join(dir, 'autoupdate.json');
-  let set = new Set<string>();
-  try {
-    if (existsSync(file)) set = new Set(JSON.parse(readFileSync(file, 'utf8')) as string[]);
-  } catch {
-    /* start fresh */
-  }
-  return {
-    set: set as ReadonlySet<string>,
-    add(key: string) {
-      set.add(key);
-      try {
-        writeFileSync(file, JSON.stringify([...set].slice(-200)));
-      } catch (e) {
-        log.warn('Could not persist auto-update attempts', { error: errMsg(e) });
-      }
-    },
-  };
 }
 
 async function start(): Promise<void> {
@@ -105,16 +94,21 @@ async function start(): Promise<void> {
   const flaps = new AddonFlapTracker();
   const cpu = cpuSampler();
   cpu();
-  const inflight = inflightStore(DATA_DIR);
-  const attempted = attemptedStore(DATA_DIR);
-
-  const updateDeps: UpdateDeps = {
-    sup,
-    sleep,
-    now: Date.now,
-    saveInflight: (i) => inflight.save(i),
-    clearInflight: () => inflight.clear(),
+  const updateState = fileUpdateStateStore(DATA_DIR);
+  const historyFile = historyStore(DATA_DIR);
+  const history = historyFile.load();
+  const saveHistory = () => {
+    try {
+      historyFile.save(history);
+    } catch (e) {
+      log.warn('Could not persist auto-update history', { error: errMsg(e) });
+    }
   };
+  /** target -> time until which auto-update leaves it alone (Hub refused the audit doc). */
+  const auditPaused = new Map<string, number>();
+  let autoRunning = false;
+
+  const updateDeps: UpdateDeps = { sup, sleep, now: Date.now, state: updateState };
 
   const cpuTemp = (): number | null => {
     const sys = readSysCpuTemp();
@@ -143,17 +137,20 @@ async function start(): Promise<void> {
     if (piRunning || stopping) return;
     piRunning = true;
     try {
-      const snap = await collectPiStatus({ sup, now: Date.now, flaps, settings: () => settings, cpuTempC: cpuTemp, cpuPercent: cpu });
+      const snap = await collectPiStatus({
+        sup,
+        now: Date.now,
+        flaps,
+        settings: () => settings,
+        cpuTempC: cpuTemp,
+        cpuPercent: cpu,
+        blocked: (t) => isBlocked(history, t),
+      });
       if (snap.coreVersion) haVersion = snap.coreVersion;
       await store.set(PATHS.homePi, snap.status as unknown as Record<string, unknown>);
       if (settings) {
-        const picks = pickAutoUpdates(settings, snap.addonUpdates, Date.now(), attempted.set, selfSlug);
-        const first = picks[0];
-        if (first) {
-          attempted.add(`${first.slug}@${first.latest}`);
-          log.info('Auto-updating add-on inside the update window', { slug: first.slug, version: first.latest });
-          void processor.runLocalUpdate(first.slug);
-        }
+        if (Date.now() - (history.lastRetentionAt ?? 0) > RETENTION_EVERY_MS) scheduleRetention('daily');
+        await maybeAutoUpdate(settings, snap.status.updates);
       }
     } catch (e) {
       log.warn('Pi status refresh failed', { error: errMsg(e) });
@@ -161,6 +158,55 @@ async function start(): Promise<void> {
       piRunning = false;
     }
   };
+  /** One auto-update at a time, in order (autoUpdate.ts), only when nothing else runs. */
+  const maybeAutoUpdate = async (s: HomeSettings, updates: UpdateCandidate[]) => {
+    if (autoRunning) return;
+    const now = Date.now();
+    for (const [t, until] of auditPaused) if (until <= now) auditPaused.delete(t);
+    const pick = pickAutoUpdate({
+      settings: s,
+      candidates: updates,
+      nowMs: now,
+      history,
+      selfSlug,
+      locked: updateState.load() !== null || processor.busy,
+      skip: new Set(auditPaused.keys()),
+    });
+    if (!pick) return;
+    const busy = await supervisorBusy(sup);
+    if (busy) {
+      log.info('Supervisor is busy; auto-update waits for the next poll', { target: pick.target, job: busy });
+      return;
+    }
+    autoRunning = true;
+    log.info('Auto-updating', { target: pick.target, version: pick.latest, mode: s.autoUpdateMode });
+    void processor
+      .runLocalUpdate(pick.target)
+      .then((res) => {
+        if (res === null) auditPaused.set(pick.target, Date.now() + AUDIT_REFUSED_PAUSE_MS);
+      })
+      .finally(() => {
+        autoRunning = false;
+      });
+  };
+
+  /** Keep the newest settings.backupRetention 'hub-' backups. Serialized with commands/updates. */
+  const scheduleRetention = (why: string) => {
+    history.lastRetentionAt = Date.now();
+    saveHistory();
+    processor.exclusive(async () => {
+      const keep = settings?.backupRetention ?? 5;
+      const inFlight = updateState.load()?.backupName;
+      const protect = new Set([...protectedBackups(history), ...(inFlight ? [inFlight] : [])]);
+      try {
+        const r = await pruneBackups(sup, keep, protect);
+        log.info('Backup retention done', { why, keep, deleted: r.deleted.length });
+      } catch (e) {
+        log.warn('Backup retention failed', { why, error: errMsg(e) });
+      }
+    });
+  };
+
   const schedulePi = (ms: number) => {
     if (piTimer) clearTimeout(piTimer);
     piTimer = setTimeout(() => void refreshPi(), ms);
@@ -177,16 +223,32 @@ async function start(): Promise<void> {
     selfSlug: () => selfSlug,
     now: Date.now,
     afterCommand: () => schedulePi(5_000),
+    onUpdateResult: (target, res, auto) => {
+      if (res.status === 'done') {
+        if (history.targets[target]) {
+          recordOutcome(history, target, true, Date.now(), null);
+          saveHistory();
+        }
+        if (res.backupName) scheduleRetention(`after updating ${target}`);
+      } else if (auto && !res.transient) {
+        recordOutcome(history, target, false, Date.now(), res.backupName);
+        saveHistory();
+        if (isBlocked(history, target)) {
+          log.warn('Auto-update of this target failed twice in a row; stopped until Retry in Home Hub', { target, backupName: res.backupName });
+        } else {
+          log.warn('Auto-update failed; next try in 6 h at the earliest', { target, backupName: res.backupName });
+        }
+      }
+    },
   });
 
-  // An update that was running when we last stopped (OS reboot, Supervisor/self restart): finish it first.
-  const pending = inflight.load();
+  // An update that was in progress when we last stopped (Core restart, OS reboot, Supervisor restart):
+  // finish it before anything else runs.
+  const pending = updateState.load();
   if (pending) {
-    log.info('Resuming verification of an in-flight update', { target: pending.target, version: pending.version });
-    processor.exclusive(async () => {
-      const res = await resumeInflight(updateDeps, pending);
-      if (pending.commandId) await processor.finish(pending.commandId, res);
-      log.info('In-flight update finished', { status: res.status, result: res.result, error: res.error });
+    void processor.resume(pending).then((res) => {
+      log.info('In-flight update finished', { target: pending.target, status: res.status, result: res.result, error: res.error });
+      schedulePi(5_000);
     });
   }
 
@@ -219,6 +281,19 @@ async function start(): Promise<void> {
     settings = parsed.data;
     mirror.setAllowlist(settings.entities);
     rules.setRules(settings.rules);
+    // Retry pressed (or auto-update switched off) for a blocked target: forget its failures.
+    const released = applyHumanResets(history, settings);
+    if (released.length) {
+      saveHistory();
+      log.info('Auto-update failures cleared by a household member', { targets: released });
+      schedulePi(5_000);
+    }
+    // Adopt states that already match new/changed rules (no fire for an episode already under way).
+    if (ha.connected) {
+      ha.getStates()
+        .then((states) => rules.seed(states.map((x) => ({ entityId: x.entity_id, state: x.state, lastChangedMs: Date.parse(x.last_changed) || Date.now() }))))
+        .catch(() => {});
+    }
     log.info('Settings loaded', { entities: settings.entities.length, services: settings.services.length, rules: settings.rules.length });
     if (!commandsUnsub) commandsUnsub = store.watchApprovedCommands((ids) => processor.onApproved(ids));
   });
