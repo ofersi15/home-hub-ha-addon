@@ -7,8 +7,6 @@ arch:
   - aarch64
   - amd64
 init: false
-startup: application
-boot: auto
 # Talk to Home Assistant (REST + WebSocket via the Supervisor proxy) with the add-on's SUPERVISOR_TOKEN.
 homeassistant_api: true
 # Supervisor API access. `manager` is the minimum role that covers /addons, /backups, /store,
