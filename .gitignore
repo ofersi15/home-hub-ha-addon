@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.log
+.env
+.env.*
+# Never commit runtime state from a local test run
+data/
+device.json

@@ -1,0 +1,7 @@
+configuration:
+  hub_url:
+    name: Home Hub URL
+    description: Base URL of your Home Hub (HTTPS). Leave the default unless you run your own Hub.
+  pairing_code:
+    name: Pairing code
+    description: One-time code from Home Hub Settings -> Home -> Pair. Used once on first start; you can clear it afterwards.

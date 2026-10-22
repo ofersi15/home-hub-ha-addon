@@ -1,0 +1,25 @@
+name: Home Hub
+version: 0.1.0
+slug: home_hub
+description: Connects Home Assistant to Home Hub (outbound only) - entity mirror, allowlisted commands, Pi health and updates.
+url: https://github.com/ofersi15/home-hub-ha-addon
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+# Talk to Home Assistant (REST + WebSocket via the Supervisor proxy) with the add-on's SUPERVISOR_TOKEN.
+homeassistant_api: true
+# Supervisor API access. `manager` is the minimum role that covers /addons, /backups, /store,
+# /core|/os|/supervisor update and /addons/<slug>/restart. See DECISIONS.md (D2).
+hassio_api: true
+hassio_role: manager
+# No ports, no host_network, no privileged, no extra mappings: the add-on only makes outbound
+# connections (Supervisor, HA Core, Home Hub over HTTPS).
+options:
+  hub_url: "https://oferel-hub.web.app"
+  pairing_code: ""
+schema:
+  hub_url: url
+  pairing_code: "str?"
