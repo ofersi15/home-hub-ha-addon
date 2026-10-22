@@ -1,5 +1,5 @@
 name: Home Hub
-version: 0.2.1
+version: 0.3.0
 slug: home_hub
 description: Connects Home Assistant to Home Hub (outbound only) - entity mirror, allowlisted commands, Pi health and updates.
 url: https://github.com/ofersi15/home-hub-ha-addon

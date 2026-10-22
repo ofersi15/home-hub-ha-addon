@@ -34,9 +34,10 @@ export function inWindow(nowMs: number, window: { start: string; end: string }):
 }
 
 
-/** Update order: add-ons 0, supervisor 1, core 2, os 3, this add-on 4 (never auto-picked). */
+/** Update order: add-ons 0, update.* entities 0.5, supervisor 1, core 2, os 3, this add-on 4 (never auto-picked). */
 export function updateRank(target: string, selfSlug: string | null): number {
   if (target === selfSlug) return 4;
+  if (target.startsWith('update.')) return 0.5;
   if (target === 'supervisor') return 1;
   if (target === 'core') return 2;
   if (target === 'os') return 3;

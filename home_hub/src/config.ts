@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 
 /** Must match config.yaml `version` and package.json (tests/version.test.ts checks). */
-export const ADDON_VERSION = '0.2.1';
+export const ADDON_VERSION = '0.3.0';
 
 /** The add-on's private persistent volume (mapped by the Supervisor). */
 export const DATA_DIR = process.env.HOME_HUB_DATA_DIR ?? '/data';

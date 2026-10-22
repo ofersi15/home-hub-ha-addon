@@ -11,10 +11,14 @@
  * - The state is cleared only AFTER the command doc has the outcome (the caller runs `after`).
  * - OS: a version that is installed but not booted yet ("pending") is finished with one reboot (Supervisor
  *   `execute_reboot` suggestion), backup first like any update; never a second reboot (DECISIONS D14).
+ * - HA `update.*` entities that the Supervisor does not manage (HACS integrations/cards, device firmware):
+ *   HA-config backup -> `update.install` -> verify the entity's installed_version -> restart HA once if a
+ *   "restart required" repair is open, reboot once if the update raised a NEW reboot suggestion (D15).
  */
 import { createBackup, type BackupSpec } from './backup.js';
 import { PLATFORM_TARGETS } from './contract.js';
 import { errMsg, logger } from './log.js';
+import type { HaIssue } from './haWs.js';
 import { SupervisorError, type SupervisorApi } from './supervisor.js';
 import type { UpdateState, UpdateStateStore } from './updateState.js';
 import { nyParts, safeName, type Clock, type Sleep } from './util.js';
@@ -50,23 +54,46 @@ export interface UpdateDeps {
   backupTimeoutMs?: number;
   /** How long a manual update waits for running Supervisor jobs to finish (default 10 min). */
   jobsWaitMs?: number;
+  /** Home Assistant (WebSocket): needed for update.* entity targets only. */
+  ha?: EntityUpdateHa;
 }
 
-export type Target = 'core' | 'os' | 'supervisor' | { addon: string };
+/** What entity updates need from HA. */
+export interface EntityUpdateHa {
+  readonly connected: boolean;
+  callService(domain: string, service: string, data: Record<string, unknown>, entityId: string, timeoutMs?: number): Promise<void>;
+  listIssues(): Promise<HaIssue[]>;
+}
+
+export type Target = 'core' | 'os' | 'supervisor' | { addon: string } | { entity: string };
+
+const isAddon = (t: Target): t is { addon: string } => typeof t !== 'string' && 'addon' in t;
+const isEntity = (t: Target): t is { entity: string } => typeof t !== 'string' && 'entity' in t;
+
+/** An HA update entity the add-on may install (not a Supervisor one: those are core/os/supervisor/add-on targets). */
+export const isEntityTarget = (t: string) => /^update\.[a-z0-9_]+$/.test(t);
 
 export function parseTarget(t: string): Target | null {
   if ((PLATFORM_TARGETS as readonly string[]).includes(t)) return t as 'core' | 'os' | 'supervisor';
+  if (isEntityTarget(t)) return { entity: t };
   return /^[a-z0-9_]+$/.test(t) ? { addon: t } : null;
 }
 
-const targetKey = (t: Target) => (typeof t === 'string' ? t : t.addon);
+const targetKey = (t: Target) => (typeof t === 'string' ? t : isAddon(t) ? t.addon : t.entity);
 
-/** Verify budget after the update call: Core/OS 20 min (restart / reboot), Supervisor 10, add-ons 5. */
+/**
+ * Verify budget after the update call: Core/OS 20 min (restart / reboot), Supervisor 10, add-ons 5,
+ * update.* entities 45 (device firmware over Z-Wave is slow; the loop ends as soon as it is done).
+ */
 export function defaultVerifyTimeoutMs(target: string): number {
   if (target === 'core' || target === 'os') return 20 * 60 * 1000;
   if (target === 'supervisor') return 10 * 60 * 1000;
+  if (isEntityTarget(target)) return 45 * 60 * 1000;
   return 5 * 60 * 1000;
 }
+
+/** `update.install` waits for the install inside HA; past this the call times out and verification decides. */
+export const ENTITY_INSTALL_CALL_MS = 2 * 60 * 1000;
 
 interface VersionInfo {
   name: string;
@@ -109,7 +136,29 @@ export function osPendingVersion(i: OsInfo | null | undefined): string | null {
 
 const PLATFORM_NAMES = { core: 'Home Assistant Core', os: 'Home Assistant OS', supervisor: 'Supervisor' } as const;
 
+interface EntityState {
+  state?: string;
+  attributes?: Record<string, unknown>;
+}
+
+const str = (v: unknown) => (typeof v === 'string' && v !== '' ? v : null);
+
+/** HA reports `in_progress` as true or a percentage while an install runs. */
+export const entityInProgress = (a: Record<string, unknown>) => a.in_progress === true || typeof a.in_progress === 'number';
+
 async function readVersion(sup: SupervisorApi, t: Target): Promise<VersionInfo> {
+  if (isEntity(t)) {
+    const s = await sup.core<EntityState>(`/api/states/${t.entity}`);
+    const a = s.attributes ?? {};
+    const installed = str(a.installed_version) ?? 'unknown';
+    const latest = str(a.latest_version) ?? installed;
+    return {
+      name: str(a.title) ?? str(a.friendly_name) ?? t.entity,
+      installed,
+      latest,
+      updateAvailable: s.state === 'on' && !entityInProgress(a) && latest !== installed,
+    };
+  }
   const path = typeof t === 'string' ? `/${t}/info` : `/addons/${t.addon}/info`;
   const i = await sup.get<SupInfo & OsInfo>(path);
   const name = typeof t === 'string' ? PLATFORM_NAMES[t] : (i.name ?? t.addon);
@@ -150,11 +199,25 @@ export function preUpdateBackupName(target: string, version: string, nowMs: numb
 }
 
 function backupSpec(t: Target, name: string): BackupSpec {
-  // Add-on: partial backup of just that add-on. Core/OS/Supervisor: full backup.
-  return typeof t === 'string' ? { name, kind: 'full' } : { name, kind: 'partial', addons: [t.addon], homeassistant: false };
+  // Add-on: partial backup of just that add-on. update.* entity: HA config (custom_components, www).
+  // Core/OS/Supervisor: full backup.
+  if (isAddon(t)) return { name, kind: 'partial', addons: [t.addon], homeassistant: false };
+  if (isEntity(t)) return { name, kind: 'partial', addons: [], homeassistant: true };
+  return { name, kind: 'full' };
 }
 
-async function postUpdate(sup: SupervisorApi, t: Target, version: string): Promise<void> {
+async function postUpdate(deps: UpdateDeps, t: Target, version: string): Promise<void> {
+  const sup = deps.sup;
+  if (isEntity(t)) {
+    if (!deps.ha) throw new Error('Home Assistant is not connected');
+    try {
+      await deps.ha.callService('update', 'install', {}, t.entity, ENTITY_INSTALL_CALL_MS);
+    } catch (e) {
+      // Still installing inside HA (firmware): verification decides.
+      if (!/timed out/i.test(errMsg(e))) throw e;
+    }
+    return;
+  }
   const long = { timeoutMs: 60 * 60 * 1000 };
   if (t === 'core') await sup.post('/core/update', { version, backup: USE_BUILTIN_UPDATE_BACKUP }, long);
   else if (t === 'os') await sup.post('/os/update', { version }, long);
@@ -197,7 +260,7 @@ export async function checkHealthy(sup: SupervisorApi, t: Target, toVersion: str
     if (core.state !== undefined && core.state !== 'running') return { ok: false, detail: `Core state is ${core.state}` };
     const v = t === 'core' ? { name: PLATFORM_NAMES.core, installed: core.version ?? 'unknown', state: core.state } : await readVersion(sup, t);
     if (!versionAtLeast(v.installed, toVersion)) return { ok: false, detail: `${v.name} is ${v.installed}, expected ${toVersion}` };
-    if (typeof t !== 'string' && requireStarted && v.state !== 'started') {
+    if (isAddon(t) && requireStarted && v.state !== 'started') {
       return { ok: false, detail: `${v.name} state is ${v.state ?? 'unknown'}`, addonDown: v.state === 'stopped' || v.state === 'error' };
     }
     return { ok: true, detail: 'HA healthy' };
@@ -232,6 +295,9 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
   const t = parseTarget(targetStr);
   if (!t) return failed(`Unknown update target '${targetStr}'`, null);
   const key = targetKey(t);
+  if (isEntity(t) && !deps.ha?.connected) {
+    return failed(`Home Assistant is not connected; update of ${key} was not started.`, null, { transient: true });
+  }
 
   // 0. The global lock: one update at a time, across restarts.
   const held = deps.state.load();
@@ -256,7 +322,8 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
   if (busy) return failed(`Supervisor is busy (${busy}); update of ${info.name} was not started.`, null, { transient: true });
 
   const toVersion = activate ? (info.pending as string) : info.latest;
-  const backupName = preUpdateBackupName(key, toVersion, deps.now());
+  // update.* entity: the backup name drops the redundant "update." (hub-pre-update-local_tuya_update-...).
+  const backupName = preUpdateBackupName(key.replace(/^update\./, ''), toVersion, deps.now());
   const base: Omit<UpdateState, 'phase'> = {
     target: key,
     fromVersion: info.installed,
@@ -264,9 +331,10 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
     backupName,
     startedAt: deps.now(),
     commandId,
-    requireStarted: typeof t !== 'string' && info.state === 'started',
+    requireStarted: isAddon(t) && info.state === 'started',
     auto: opts.auto === true,
     rebootRequested: activate,
+    ...(isEntity(t) ? { preSuggestions: await suggestionIds(deps.sup) } : {}),
   };
   const clear = async () => deps.state.clear();
 
@@ -289,7 +357,7 @@ export async function runUpdate(deps: UpdateDeps, targetStr: string, commandId: 
           { after: clear },
         );
       }
-    } else await postUpdate(deps.sup, t, toVersion);
+    } else await postUpdate(deps, t, toVersion);
   } catch (e) {
     if (!(e instanceof SupervisorError && e.kind === 'network')) {
       return failed(`Update of ${info.name} to ${toVersion} failed: ${errMsg(e)}. ${restoreHint(backupName)}`, backupName, { after: clear });
@@ -309,16 +377,33 @@ interface Suggestion {
   reference?: string | null;
 }
 
+/** uuids of the Supervisor's current suggestions ([] when unknown). */
+async function suggestionIds(sup: SupervisorApi): Promise<string[]> {
+  try {
+    const info = await sup.get<{ suggestions?: Suggestion[] }>('/resolution/info');
+    return (info.suggestions ?? []).map((s) => s.uuid);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Restart/reboot suggestions the Supervisor raised (GET /resolution/info). Only `execute_restart`, and
- * `execute_reboot` right after our own OS update (unless we already rebooted for it), are followed;
- * anything else is reported, not applied.
+ * `execute_reboot` right after our own OS update (unless we already rebooted for it) or one that is NEW
+ * since an update.* entity update (`preSuggestions`: e.g. Pi firmware), are followed; anything else is
+ * reported, not applied.
  */
-export async function restartSuggestions(sup: SupervisorApi, target: string, rebooted = false): Promise<{ apply: Suggestion[]; skipped: Suggestion[] }> {
+export async function restartSuggestions(
+  sup: SupervisorApi,
+  target: string,
+  rebooted = false,
+  preSuggestions?: readonly string[],
+): Promise<{ apply: Suggestion[]; skipped: Suggestion[] }> {
   try {
     const info = await sup.get<{ suggestions?: Suggestion[] }>('/resolution/info');
     const relevant = (info.suggestions ?? []).filter((s) => s.type === 'execute_restart' || s.type === 'execute_reboot');
-    const ok = (s: Suggestion) => /^[0-9a-f]{32}$/.test(s.uuid) && (s.type === 'execute_restart' || (target === 'os' && !rebooted));
+    const rebootOk = (s: Suggestion) => (target === 'os' ? !rebooted : preSuggestions !== undefined && !preSuggestions.includes(s.uuid));
+    const ok = (s: Suggestion) => /^[0-9a-f]{32}$/.test(s.uuid) && (s.type === 'execute_restart' || rebootOk(s));
     return { apply: relevant.filter(ok), skipped: relevant.filter((s) => !ok(s)) };
   } catch (e) {
     log.debug('GET /resolution/info failed', { error: errMsg(e) });
@@ -342,6 +427,10 @@ export async function requestReboot(sup: SupervisorApi): Promise<boolean> {
   }
   return true;
 }
+
+/** A Repairs issue asking for an HA restart (HACS: `restart_required` after an integration update). */
+export const isRestartIssue = (i: HaIssue) =>
+  i.ignored !== true && (/restart_required/i.test(i.issue_id) || /restart_required/i.test(i.translation_key ?? ''));
 
 /** OS still on the old version after our update, with the new one installed: wait this long, then reboot once. */
 export const OS_REBOOT_GRACE_MS = 3 * 60 * 1000;
@@ -381,7 +470,7 @@ async function finishVerify(deps: UpdateDeps, s: UpdateState): Promise<ExecResul
         }
       }
     }
-    if (!last.ok && last.addonDown && !started && typeof t !== 'string') {
+    if (!last.ok && last.addonDown && !started && isAddon(t)) {
       // Updated but not running: start it once.
       started = true;
       log.warn('Add-on did not come back after its update; starting it once', { slug: t.addon });
@@ -401,11 +490,15 @@ async function finishVerify(deps: UpdateDeps, s: UpdateState): Promise<ExecResul
     );
   }
 
-  const sugg = await restartSuggestions(deps.sup, s.target, rebooted);
+  const sugg = await restartSuggestions(deps.sup, s.target, rebooted, s.preSuggestions);
+  // HACS integrations need an HA restart to load; skipped when a Supervisor restart/reboot covers it.
+  const restartHa =
+    isEntity(t) && deps.ha !== undefined && sugg.apply.length === 0 && (await deps.ha.listIssues().then((l) => l.some(isRestartIssue), () => false));
   let note = started ? ' Started it once after the update.' : '';
   if (rebootDone) note += ' Rebooted once to boot it.';
   if (sugg.apply.length) note += ` Supervisor suggested ${sugg.apply.map(describeSuggestion).join(', ')}; applied once.`;
   if (sugg.skipped.length) note += ` Supervisor suggests ${sugg.skipped.map(describeSuggestion).join(', ')}; not applied automatically.`;
+  if (restartHa) note += ' Home Assistant asked for a restart; restarted it once.';
   return {
     status: 'done',
     result: `Updated ${s.target} ${s.fromVersion} -> ${s.toVersion}. Backup '${s.backupName}' created first; ${last.detail}.${note}`.slice(0, 2000),
@@ -420,6 +513,14 @@ async function finishVerify(deps: UpdateDeps, s: UpdateState): Promise<ExecResul
           await deps.sup.post(`/resolution/suggestion/${sg.uuid}`, {}, { timeoutMs: 10 * 60 * 1000 });
         } catch (e) {
           if (!(e instanceof SupervisorError && e.kind === 'network')) log.warn('Applying the suggestion failed', { error: errMsg(e) });
+        }
+      }
+      if (restartHa) {
+        log.info('Restarting Home Assistant after our update (restart required)', { target: s.target });
+        try {
+          await deps.sup.post('/core/restart', {}, { timeoutMs: 10 * 60 * 1000 });
+        } catch (e) {
+          if (!(e instanceof SupervisorError && e.kind === 'network')) log.warn('Restarting Home Assistant failed', { error: errMsg(e) });
         }
       }
     },

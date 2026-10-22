@@ -37,13 +37,16 @@ const POST_ALLOW: RegExp[] = [
   // and execute_reboot once to boot an OS update we installed or found installed-but-not-booted;
   // see DECISIONS.md D10 and D14. No host power endpoint is allowlisted.
   /^\/resolution\/suggestion\/[0-9a-f]{32}$/,
+  // Restart HA Core once after an update.* entity update that left a "restart required" repair (HACS
+  // integrations); see DECISIONS.md D15.
+  /^\/core\/restart$/,
 ];
 
 /** Retention of our own 'hub-' backups only (retention.ts checks the name via /backups/<slug>/info first). */
 const DELETE_ALLOW: RegExp[] = [new RegExp(`^/backups/${BACKUP_SLUG}$`)];
 
-/** HA Core REST (proxied by the Supervisor at /core/api/...). Read-only probes only. */
-const CORE_GET_ALLOW: RegExp[] = [/^\/api\/$/, /^\/api\/config$/];
+/** HA Core REST (proxied by the Supervisor at /core/api/...). Read-only probes + update.* entity states only. */
+const CORE_GET_ALLOW: RegExp[] = [/^\/api\/$/, /^\/api\/config$/, /^\/api\/states\/update\.[a-z0-9_]+$/];
 
 export type Method = 'GET' | 'POST' | 'DELETE';
 

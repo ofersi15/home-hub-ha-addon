@@ -231,3 +231,27 @@ it only rebooted right after its own verified OS update), so the OS update would
 - Still no `/host/reboot` in the allowlist: the reboot is always the Supervisor's own repair action for
   a reboot it asked for, and only to boot a newer installed OS. This widens D10 ("only right after our
   OS update") to "only to boot an OS update", which is what Ofer asked for.
+
+## D15 - HA update entities outside the Supervisor (0.3.0)
+
+Ofer (2026-10-22) asked to turn off HA's "System - Force All Updates and Restart at 1AM" automation once
+the add-on properly replaces it. That automation ran `update.install` on EVERY `update.*` entity that was
+on: besides Supervisor-managed ones (platform `hassio`: Core/OS/Supervisor/add-ons, already ours) that is
+HACS (alexa_media_player, local_tuya, tp_link_deco, Mushroom and other cards, HACS itself) and device
+firmware (Z-Wave switch/controller, JLM shade motors, Raspberry Pi 4 firmware). It took no backup of
+its own beyond Core's, and its restart condition (`sensor.hacs`, absent) never fired.
+
+- **Targets** = `update.<object_id>`; `parseTarget` -> `{ entity }`. Candidates: entity registry platform
+  known and not `hassio`, state `on`, supports install (feature bit 1), not `in_progress`. Unknown
+  platform (registry not loaded) -> skipped. Policy: own flag or `'*'` (Hub label: "All add-ons,
+  integrations and firmware"); Hub rules unchanged (any non-platform target already followed `'*'`).
+- **Engine**: same lock/busy/verify path. Backup = partial with the HA config only (custom_components,
+  www); install via HA WebSocket `update.install` (call capped at 2 min, a timeout means "still
+  installing" and verification decides); verify = HA healthy + the entity's `installed_version` reaches
+  the expected version, 45 min budget (Z-Wave firmware is slow). HA not connected -> transient.
+- **Restart when needed**: after a verified entity update, HA Core is restarted once if a non-ignored
+  "restart required" repair is open (HACS integrations), via Supervisor `POST /core/restart` (the only
+  new write; `/core/stop`, `/core/rebuild` stay refused). An `execute_reboot` suggestion is applied only
+  if it did not exist before this update (uuids saved in the lock as `preSuggestions`); a reboot covers
+  the restart. After a resume (no `preSuggestions`) no reboot is taken.
+- **Order**: add-ons, entities, Supervisor, Core, OS (rank 0.5).

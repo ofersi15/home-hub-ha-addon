@@ -47,6 +47,9 @@ How every update runs:
    If the Supervisor then asks for a restart (or a reboot right after an OS update), it is done once.
    An OS version that is installed but not booted yet counts as an update too: backup, one reboot,
    verify. The add-on never reboots twice for the same update.
+   HA update entities outside the Supervisor (HACS integrations and cards, device firmware) are
+   updated the same way: HA-config backup, `update.install`, verify, then one HA restart if Home
+   Assistant asks for it (or one reboot if the update newly asked for that).
 5. **Result** in Home Hub. On failure the message names the backup: *restore from this backup*
    (Settings -> System -> Backups in Home Assistant).
 

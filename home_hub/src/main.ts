@@ -20,7 +20,7 @@ import { HaWebSocket, type HaRegistry } from './haWs.js';
 import { errMsg, logger, registerSecret } from './log.js';
 import { EntityMirror } from './mirror.js';
 import { ensurePaired } from './pairing.js';
-import { AddonFlapTracker, collectPiStatus, cpuSampler, readSysCpuTemp, sampleAddonStates } from './piStatus.js';
+import { AddonFlapTracker, collectPiStatus, cpuSampler, entityUpdateCandidates, readSysCpuTemp, sampleAddonStates } from './piStatus.js';
 import { pruneBackups } from './retention.js';
 import { RuleEngine } from './rules.js';
 import { createSupervisorClient } from './supervisor.js';
@@ -108,7 +108,7 @@ async function start(): Promise<void> {
   const auditPaused = new Map<string, number>();
   let autoRunning = false;
 
-  const updateDeps: UpdateDeps = { sup, sleep, now: Date.now, state: updateState };
+  const updateDeps: UpdateDeps = { sup, sleep, now: Date.now, state: updateState, ha };
 
   const cpuTemp = (): number | null => {
     const sys = readSysCpuTemp();
@@ -145,6 +145,11 @@ async function start(): Promise<void> {
         cpuTempC: cpuTemp,
         cpuPercent: cpu,
         blocked: (t) => isBlocked(history, t),
+        entityUpdates: async () => {
+          if (!ha.connected || !registry) return [];
+          const platform = new Map(registry.entities.map((e) => [e.entity_id, e.platform]));
+          return entityUpdateCandidates(await ha.getStates(), (id) => platform.get(id));
+        },
       });
       if (snap.coreVersion) haVersion = snap.coreVersion;
       await store.set(PATHS.homePi, snap.status as unknown as Record<string, unknown>);

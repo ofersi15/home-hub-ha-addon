@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+- **HA update entities the Supervisor does not manage are updated too**: HACS integrations and
+  cards, device firmware (Z-Wave, the Pi's own firmware), ... (every `update.*` entity whose
+  integration is not `hassio`). Target = the entity id (`update.local_tuya_update`); switched on by
+  its own flag or `'*'`. Pi status lists them when an update is pending.
+- Same engine: lock -> Supervisor idle -> backup of the HA config (`hub-pre-update-<object_id>-<version>-...`)
+  -> `update.install` -> verify the entity reports the new version (up to 45 min for slow firmware).
+- Restart when needed: if a "restart required" repair is open afterwards (HACS integrations), HA Core
+  is restarted once (`POST /core/restart`, newly allowlisted); if the update raised a NEW
+  `execute_reboot` suggestion (e.g. Pi firmware), it is applied once. Older suggestions are left alone.
+- Order: add-ons, then update entities, then Supervisor, Core, OS.
+- Replaces Home Assistant's "Force All Updates and Restart at 1AM" automation, which installed these
+  without a backup and never restarted HA.
+
 ## 0.2.1
 
 - **OS updates reboot into the new version.** An OS version that is installed but not booted yet

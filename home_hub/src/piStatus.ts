@@ -8,7 +8,8 @@ import os from 'node:os';
 import { autoUpdateEnabled, type AddonInfo, type HomeSettings, type PiStatus, type UpdateInfo } from './contract.js';
 import { errMsg, logger } from './log.js';
 import type { SupervisorApi } from './supervisor.js';
-import { osPendingVersion, type OsInfo } from './updateFlow.js';
+import type { HaState } from './haWs.js';
+import { entityInProgress, osPendingVersion, type OsInfo } from './updateFlow.js';
 import { iso } from './util.js';
 
 const log = logger('pi');
@@ -93,6 +94,39 @@ export interface PiDeps {
   osUptimeSeconds?: () => number | null;
   /** Auto-update stopped for this target after 2 consecutive failures (PiStatus.updates[].blocked). */
   blocked?: (target: string) => boolean;
+  /** Pending HA update.* entities the Supervisor does not manage (entityUpdateCandidates). */
+  entityUpdates?: () => Promise<Omit<UpdateInfo, 'blocked'>[]>;
+}
+
+/**
+ * HA update entities with an update to install that are NOT the Supervisor's (platform 'hassio' =
+ * Core/OS/Supervisor/add-ons, handled by their own targets): HACS integrations and cards, device
+ * firmware (Z-Wave, Pi), ... Only entities that support install, are on, and are not installing.
+ * Unknown platform (registry not loaded yet) -> skipped: we never guess.
+ */
+export function entityUpdateCandidates(states: HaState[], platformOf: (entityId: string) => string | undefined): Omit<UpdateInfo, 'blocked'>[] {
+  const out: Omit<UpdateInfo, 'blocked'>[] = [];
+  for (const st of states) {
+    if (!/^update\.[a-z0-9_]+$/.test(st.entity_id) || st.state !== 'on') continue;
+    const platform = platformOf(st.entity_id);
+    if (!platform || platform === 'hassio') continue;
+    const a = st.attributes;
+    const features = typeof a.supported_features === 'number' ? a.supported_features : 0;
+    if ((features & 1) === 0 || entityInProgress(a)) continue;
+    const installed = typeof a.installed_version === 'string' ? a.installed_version : null;
+    const latest = typeof a.latest_version === 'string' ? a.latest_version : null;
+    if (!installed || !latest || installed === latest) continue;
+    const title = typeof a.title === 'string' && a.title ? a.title : typeof a.friendly_name === 'string' ? a.friendly_name : st.entity_id;
+    out.push({
+      target: st.entity_id,
+      name: title,
+      installed,
+      latest,
+      updateAvailable: true,
+      releaseNotesUrl: typeof a.release_url === 'string' ? a.release_url : null,
+    });
+  }
+  return out;
 }
 
 interface VersionedInfo extends OsInfo {
@@ -201,6 +235,13 @@ export async function collectPiStatus(deps: PiDeps): Promise<PiSnapshot> {
         blocked: deps.blocked?.(a.slug) ?? false,
       });
     }
+  }
+
+  for (const u of await (deps.entityUpdates?.() ?? Promise.resolve([])).catch((e: unknown) => {
+    log.debug('Reading HA update entities failed', { error: errMsg(e) });
+    return [];
+  })) {
+    updates.push({ ...u, blocked: deps.blocked?.(u.target) ?? false });
   }
 
   const latestBackup = [...(backups?.backups ?? [])]

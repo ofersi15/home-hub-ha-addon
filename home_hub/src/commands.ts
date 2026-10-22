@@ -92,7 +92,7 @@ export function validateCommand(cmd: HomeCommand, ctx: ValidationCtx): Validatio
       if (cmd.sensitive && !hasHumanApproval(cmd)) return reject('Sensitive command without human approval.');
       return { ok: true };
     case 'update': {
-      if (!cmd.target || !parseTarget(cmd.target)) return reject('update needs a valid target (core, os, supervisor or an add-on slug).');
+      if (!cmd.target || !parseTarget(cmd.target)) return reject('update needs a valid target (core, os, supervisor, an add-on slug or an update.* entity).');
       if (cmd.target === 'self' || cmd.target === ctx.selfSlug) {
         return reject('The Supervisor does not let an add-on update itself; update Home Hub from its add-on page in Home Assistant.');
       }

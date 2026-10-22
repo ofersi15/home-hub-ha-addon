@@ -26,6 +26,8 @@ export const UpdateState = z.object({
   auto: z.boolean().default(false),
   /** OS only: we already asked for the reboot that boots the new version (never ask twice). */
   rebootRequested: z.boolean().default(false),
+  /** update.* entities: Supervisor suggestion uuids that existed before the update (only NEW ones are ours). */
+  preSuggestions: z.array(z.string()).optional(),
 });
 export type UpdateState = z.infer<typeof UpdateState>;
 

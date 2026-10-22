@@ -29,12 +29,22 @@ export interface HaRegistry {
     original_name?: string | null;
     device_class?: string | null;
     original_device_class?: string | null;
+    /** Integration that provides the entity ('hassio', 'hacs', 'zwave_js', ...). */
+    platform?: string;
   }[];
+}
+
+/** A Repairs issue (WS `repairs/list_issues`). */
+export interface HaIssue {
+  domain: string;
+  issue_id: string;
+  translation_key?: string | null;
+  ignored?: boolean;
 }
 
 /** What the rest of the add-on needs from HA (mocked in tests). */
 export interface HaApi {
-  callService(domain: string, service: string, data: Record<string, unknown>, entityId: string): Promise<void>;
+  callService(domain: string, service: string, data: Record<string, unknown>, entityId: string, timeoutMs?: number): Promise<void>;
   getStates(): Promise<HaState[]>;
   getRegistry(): Promise<HaRegistry>;
 }
@@ -200,8 +210,13 @@ export class HaWebSocket extends EventEmitter<HaEvents> implements HaApi {
     });
   }
 
-  async callService(domain: string, service: string, data: Record<string, unknown>, entityId: string): Promise<void> {
-    await this.request({ type: 'call_service', domain, service, service_data: data, target: { entity_id: entityId } });
+  async callService(domain: string, service: string, data: Record<string, unknown>, entityId: string, timeoutMs = 30_000): Promise<void> {
+    await this.request({ type: 'call_service', domain, service, service_data: data, target: { entity_id: entityId } }, timeoutMs);
+  }
+
+  async listIssues(): Promise<HaIssue[]> {
+    const r = await this.request<{ issues?: HaIssue[] }>({ type: 'repairs/list_issues' });
+    return r?.issues ?? [];
   }
 
   getStates(): Promise<HaState[]> {
