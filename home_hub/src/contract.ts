@@ -197,8 +197,14 @@ export const HomeSettings = z.object({
   /** Keep this many add-on-created backups (names starting 'hub-'); older ones are deleted. Never touches other backups. */
   backupRetention: z.number().int().min(2).max(30).default(5),
   alerts: z
-    .object({ diskPercent: z.number().default(85), cpuTempC: z.number().default(80), offlineMinutes: z.number().default(10) })
-    .default({ diskPercent: 85, cpuTempC: 80, offlineMinutes: 10 }),
+    .object({
+      diskPercent: z.number().default(85),
+      cpuTempC: z.number().default(80),
+      offlineMinutes: z.number().default(10),
+      /** Supervisor reasons the household hid on the Pi page (Hub-side only; the add-on doesn't use it). */
+      ignoredSupervisorReasons: z.array(z.string().max(60)).max(30).default([]),
+    })
+    .default({ diskPercent: 85, cpuTempC: 80, offlineMinutes: 10, ignoredSupervisorReasons: [] }),
 });
 export type HomeSettings = z.infer<typeof HomeSettings>;
 

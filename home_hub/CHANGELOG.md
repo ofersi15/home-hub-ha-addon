@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- **Entities deleted in Home Assistant disappear from the Hub.** When HA removes an allowlisted entity
+  (`state_changed` with no new state), the add-on deletes its `homeEntities` copy instead of leaving a stale
+  "Unavailable" tile. Removing it from the allowlist in Settings still does the same.
+
 ## 0.3.0
 
 - **HA update entities the Supervisor does not manage are updated too**: HACS integrations and

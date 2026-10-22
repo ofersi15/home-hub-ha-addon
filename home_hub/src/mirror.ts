@@ -127,7 +127,14 @@ export class EntityMirror {
   onStateChanged(entityId: string, newState: HaState | null): void {
     if (newState) this.states.set(entityId, newState);
     else this.states.delete(entityId);
-    if (this.allow.has(entityId) && newState) this.throttle.push(entityId, newState);
+    if (!this.allow.has(entityId)) return;
+    if (newState) {
+      this.throttle.push(entityId, newState);
+    } else {
+      // Entity deleted in HA (new_state null): drop its Hub copy so it doesn't linger as a stale tile.
+      this.throttle.cancel(entityId);
+      this.store.remove(PATHS.homeEntity(entityId)).catch((e) => log.warn('Removing deleted entity failed', { entityId, error: errMsg(e) }));
+    }
   }
 
   async catalog(reg: HaRegistry | null): Promise<number> {
