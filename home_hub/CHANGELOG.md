@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- **Hapoel Ramat Gan basketball schedule relay** for the Hub's new Sports page. ibasketball.co.il refuses
+  Google Cloud IPs, so every 2 h the add-on fetches that one fixed public URL (the team's games + venue
+  names) and writes the trimmed JSON to `hub/main/home/sportsIba`. Not a generic proxy: the URL is a
+  constant in `sportsFeed.ts`.
+
 ## 0.3.1
 
 - **Entities deleted in Home Assistant disappear from the Hub.** When HA removes an allowlisted entity

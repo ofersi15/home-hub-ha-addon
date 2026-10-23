@@ -268,6 +268,8 @@ export const HUB = 'hub/main';
 export const PATHS = {
   homeState: `${HUB}/home/state`,
   homePi: `${HUB}/home/pi`,
+  /** Hapoel Ramat Gan basketball schedule relay (see sportsFeed.ts). */
+  homeSportsIba: `${HUB}/home/sportsIba`,
   homeEntities: `${HUB}/homeEntities`,
   homeEntity: (entityId: string) => `${HUB}/homeEntities/${entityId}`,
   homeCatalog: (domain: string) => `${HUB}/homeCatalog/${domain}`,
