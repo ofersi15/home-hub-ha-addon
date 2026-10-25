@@ -23,7 +23,7 @@ import { ensurePaired } from './pairing.js';
 import { AddonFlapTracker, collectPiStatus, cpuSampler, entityUpdateCandidates, readSysCpuTemp, sampleAddonStates } from './piStatus.js';
 import { pruneBackups } from './retention.js';
 import { RuleEngine } from './rules.js';
-import { relaySportsFeed, SPORTS_FEED_MS } from './sportsFeed.js';
+import { relaySportsFeed, SPORTS_LIVE_MS } from './sportsFeed.js';
 import { createSupervisorClient } from './supervisor.js';
 import { supervisorBusy, type UpdateDeps } from './updateFlow.js';
 import { fileUpdateStateStore } from './updateState.js';
@@ -338,7 +338,7 @@ async function start(): Promise<void> {
   timers.push(setInterval(() => void refreshPi(), PI_STATUS_MS));
   timers.push(setInterval(() => void refreshCatalog(), CATALOG_MS));
   void relaySportsFeed(store);
-  timers.push(setInterval(() => void relaySportsFeed(store), SPORTS_FEED_MS));
+  timers.push(setInterval(() => void relaySportsFeed(store), SPORTS_LIVE_MS));
 
   // ---- graceful shutdown ----
   const shutdown = async (signal: string) => {

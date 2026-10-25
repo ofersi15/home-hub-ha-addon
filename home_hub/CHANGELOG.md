@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+- **Live Hapoel Ramat Gan basketball scores.** The sports relay also carries each game's live state
+  (`state`, `quarter_current`, `quarter_current_time`) and runs every 2 min while a game is on (start
+  15 min ahead to 3.5 h ago, until it is finished) instead of every 2 h. Same fixed URLs.
+
 ## 0.3.2
 
 - **Hapoel Ramat Gan basketball schedule relay** for the Hub's new Sports page. ibasketball.co.il refuses

@@ -1,8 +1,9 @@
 /**
  * Hapoel Ramat Gan basketball schedule relay. ibasketball.co.il (the Israel Basketball Association)
  * sits behind Cloudflare rules that refuse Google Cloud IPs, so Home Hub's functions can't read it;
- * the Pi (a home connection) fetches this ONE fixed public URL every 2 h and writes the trimmed JSON
- * (plus the league table and team logos) to hub/main/home/sportsIba, which the Hub's sports sync parses. Not a generic proxy: the URL is a
+ * the Pi (a home connection) fetches this ONE fixed public URL every 2 h (every 2 min while a game is on,
+ * for live scores) and writes the trimmed JSON (plus the league table and team logos) to
+ * hub/main/home/sportsIba, which the Hub's sports sync parses. Not a generic proxy: the URL is a
  * constant here, nothing from the Hub decides what is fetched.
  */
 import { PATHS } from './contract.js';
@@ -12,6 +13,8 @@ import type { HubStore } from './store.js';
 const log = logger('sports');
 
 export const SPORTS_FEED_MS = 2 * 60 * 60_000;
+/** Tick; a relay runs on it only while a game is on (see gameOn), else every SPORTS_FEED_MS. */
+export const SPORTS_LIVE_MS = 2 * 60_000;
 const IBA = 'https://ibasketball.co.il/wp-json/sportspress/v2';
 /** Hapoel Ramat Gan/Givatayim (men), Liga Artzit. */
 const TEAM_ID = 595722;
@@ -71,6 +74,10 @@ export function trimEvents(raw: unknown): Record<string, unknown>[] {
         league: { name: str((e.league as { name?: unknown } | undefined)?.name, 120) },
         leagues: nums(e.leagues),
         seasons: nums(e.seasons),
+        // Live state ('' until the scorer starts; 'finished' after): quarter + clock left in it.
+        state: str(e.state, 20),
+        quarter_current: typeof e.quarter_current === 'number' ? e.quarter_current : str(e.quarter_current, 5),
+        quarter_current_time: str(e.quarter_current_time, 10),
       },
     ];
   });
@@ -113,16 +120,35 @@ export async function collectSportsFeed(get: Fetch, now = Date.now()) {
   return { teamId: TEAM_ID, fetchedAt: new Date(now).toISOString(), events, venues, table, logos };
 }
 
+/**
+ * A game is (about to be) on: start within 15 min ahead to 3.5 h ago, and not finished. SportsPress
+ * dates are Israel wall-clock (UTC+2/+3), so the window is widened by the offset instead of resolving it.
+ */
+export function gameOn(events: Record<string, unknown>[], now = Date.now()): boolean {
+  return events.some((e) => {
+    const local = Date.parse(`${String(e.date).slice(0, 19)}Z`);
+    if (!Number.isFinite(local) || e.state === 'finished') return false;
+    return local - 3 * 3600_000 <= now + 15 * 60_000 && local - 2 * 3600_000 >= now - 3.5 * 3600_000;
+  });
+}
+
 async function getJson(url: string): Promise<unknown> {
   const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(20_000) });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
 
-export async function relaySportsFeed(store: HubStore): Promise<void> {
+let lastRun = 0;
+let lastEvents: Record<string, unknown>[] = [];
+
+/** Called every SPORTS_LIVE_MS: relays when SPORTS_FEED_MS has passed or a game is on. */
+export async function relaySportsFeed(store: HubStore, now = Date.now()): Promise<void> {
+  if (now - lastRun < SPORTS_FEED_MS && !gameOn(lastEvents, now)) return;
+  lastRun = now;
   try {
-    const feed = await collectSportsFeed(getJson);
+    const feed = await collectSportsFeed(getJson, now);
     await store.set(PATHS.homeSportsIba, feed);
+    lastEvents = feed.events;
     log.info('Sports feed written', { events: feed.events.length });
   } catch (e) {
     log.warn('Sports feed failed', { error: errMsg(e) });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { collectSportsFeed, trimEvents } from '../src/sportsFeed.js';
+import { collectSportsFeed, gameOn, trimEvents } from '../src/sportsFeed.js';
 
 const EVENT = {
   id: 1505482,
@@ -21,7 +21,7 @@ const EVENT = {
 describe('sports feed', () => {
   it('keeps only the fields the Hub parses', () => {
     const [e] = trimEvents([EVENT, { nope: true }]);
-    expect(Object.keys(e!).sort()).toEqual(['away', 'date', 'home', 'id', 'league', 'leagues', 'link', 'seasons', 'status', 'stream', 'teams', 'venues']);
+    expect(Object.keys(e!).sort()).toEqual(['away', 'date', 'home', 'id', 'league', 'leagues', 'link', 'quarter_current', 'quarter_current_time', 'seasons', 'state', 'status', 'stream', 'teams', 'venues']);
     expect(e!.league).toEqual({ name: 'ארצית דרום' });
     expect(trimEvents('not a list')).toEqual([]);
   });
@@ -42,5 +42,16 @@ describe('sports feed', () => {
     expect(urls.some((u) => u.includes('/tables?leagues=119896&seasons=119888'))).toBe(true);
     expect(feed.table).toEqual({ '595722': { pos: 3, w: 2, l: 1, strk: 'W2' } });
     expect(feed.logos).toEqual({ '595722': 'https://ibasketball.co.il/wp-content/uploads/x-150x150.png' });
+  });
+
+  it('polls live only while a game is on (Israel wall-clock dates)', () => {
+    const [e] = trimEvents([{ ...EVENT, state: '', quarter_current: '3', quarter_current_time: '10:00' }]);
+    expect(e).toMatchObject({ state: '', quarter_current: '3', quarter_current_time: '10:00' });
+    // 19:00 Israel (UTC+2) = 17:00 UTC.
+    expect(gameOn([e!], Date.parse('2026-10-25T18:00:00Z'))).toBe(true);
+    expect(gameOn([e!], Date.parse('2026-10-25T16:50:00Z'))).toBe(true);
+    expect(gameOn([e!], Date.parse('2026-10-25T15:00:00Z'))).toBe(false);
+    expect(gameOn([e!], Date.parse('2026-10-25T21:00:00Z'))).toBe(false);
+    expect(gameOn([{ ...e!, state: 'finished' }], Date.parse('2026-10-25T18:00:00Z'))).toBe(false);
   });
 });
